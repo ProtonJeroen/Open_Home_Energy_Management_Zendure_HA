@@ -3,23 +3,27 @@
     "step": {
       "user": {
         "title": "Configure virtual battery",
-        "description": "Select the state-of-charge sensors for all SolarFlow devices. Power sensors are optional in this first read-only release.",
+        "description": "Select the state-of-charge and power sensors for all SolarFlow devices.",
         "data": {
           "soc_entities": "State-of-charge sensors",
           "power_entities": "Battery power sensors (optional)",
+          "pack_input_entities": "Pack input power sensors",
+          "pack_output_entities": "Pack output power sensors",
           "capacity_per_device": "Nominal capacity per device",
           "balance_threshold": "Maximum allowed SoC difference"
         },
         "data_description": {
-          "soc_entities": "Select one SoC sensor per SolarFlow.",
+          "soc_entities": "Select one state-of-charge sensor per SolarFlow.",
           "power_entities": "Select one power sensor per SolarFlow. Verify the sign convention later.",
-          "capacity_per_device": "For one SF2400 Pro with one battery this is normally 2400 Wh.",
-          "balance_threshold": "Batteries are considered balanced while the spread stays within this value."
+          "pack_input_entities": "Select one packInputPower sensor per SolarFlow.",
+          "pack_output_entities": "Select one outputPackPower sensor per SolarFlow.",
+          "capacity_per_device": "For one SF2400 Pro with one battery, this is normally 2400 Wh.",
+          "balance_threshold": "The batteries are considered balanced while the difference remains within this value."
         }
       }
     },
     "error": {
-      "no_soc_entities": "Select at least one SoC sensor."
+      "no_soc_entities": "Select at least one state-of-charge sensor."
     },
     "abort": {
       "single_instance_allowed": "Only one Home Energy Manager configuration is allowed."

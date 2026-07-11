@@ -18,10 +18,13 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
     CONF_CAPACITY_PER_DEVICE,
+    CONF_PACK_INPUT_ENTITIES,
+    CONF_PACK_OUTPUT_ENTITIES,
     CONF_POWER_ENTITIES,
     CONF_SOC_ENTITIES,
     DOMAIN,
 )
+
 from .entity import HomeEnergyManagerEntity
 
 
@@ -41,7 +44,13 @@ def _numeric_states(
             continue
     return values
 
-
+def _sum_numeric_states(
+    hass: HomeAssistant,
+    entity_ids: list[str],
+) -> float:
+    """Return the sum of all valid numeric states."""
+    return sum(_numeric_states(hass, entity_ids))
+    
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -49,9 +58,20 @@ async def async_setup_entry(
 ) -> None:
     """Set up Home Energy Manager sensors."""
     soc_entities = list(entry.data[CONF_SOC_ENTITIES])
-    power_entities = list(entry.data.get(CONF_POWER_ENTITIES, []))
-    source_entities = set(soc_entities) | set(power_entities)
+power_entities = list(entry.data.get(CONF_POWER_ENTITIES, []))
+pack_input_entities = list(
+    entry.data.get(CONF_PACK_INPUT_ENTITIES, [])
+)
+pack_output_entities = list(
+    entry.data.get(CONF_PACK_OUTPUT_ENTITIES, [])
+)
 
+source_entities = (
+    set(soc_entities)
+    | set(power_entities)
+    | set(pack_input_entities)
+    | set(pack_output_entities)
+)
     entities: list[SensorEntity] = [
         VirtualSocSensor(entry, source_entities, soc_entities),
         VirtualCapacitySensor(entry, source_entities, soc_entities),
@@ -62,6 +82,16 @@ async def async_setup_entry(
         OnlineDevicesSensor(entry, source_entities, soc_entities),
         VirtualStatusSensor(entry, source_entities, soc_entities, power_entities),
     ]
+
+    if pack_input_entities and pack_output_entities:
+        entities.append(
+            NetBatteryPowerSensor(
+                entry,
+                source_entities,
+                pack_input_entities,
+                pack_output_entities,
+            )
+        )
 
     if power_entities:
         entities.append(
@@ -219,8 +249,64 @@ class AvailableEnergySensor(_EnergyMixin, BaseSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"reserve_percentage": self.RESERVE_PERCENTAGE}
+        
 
+class NetBatteryPowerSensor(BaseSensor):
+    """Net battery power: positive is charging, negative is discharging."""
 
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-sync"
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        source_entities: set[str],
+        pack_input_entities: list[str],
+        pack_output_entities: list[str],
+    ) -> None:
+        """Initialize the net battery power sensor."""
+        super().__init__(
+            entry,
+            source_entities,
+            "net_battery_power",
+            "Netto batterijvermogen",
+        )
+        self._pack_input_entities = pack_input_entities
+        self._pack_output_entities = pack_output_entities
+
+    @property
+    def native_value(self) -> float | None:
+        input_values = _numeric_states(
+            self.hass,
+            self._pack_input_entities,
+        )
+        output_values = _numeric_states(
+            self.hass,
+            self._pack_output_entities,
+        )
+
+        if (
+            len(input_values) != len(self._pack_input_entities)
+            or len(output_values) != len(self._pack_output_entities)
+        ):
+            return None
+
+        return round(
+            sum(input_values) - sum(output_values),
+            1,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "tekenrichting": "positief = laden, negatief = ontladen",
+            "pack_input_entiteiten": self._pack_input_entities,
+            "pack_output_entiteiten": self._pack_output_entities,
+        }
+        
+        
 class VirtualPowerSensor(BaseSensor):
     """Sum of battery power sensors."""
 

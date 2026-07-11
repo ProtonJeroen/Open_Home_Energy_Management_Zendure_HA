@@ -8,13 +8,17 @@
           "soc_entities": "SoC-sensoren",
           "power_entities": "Accuvermogenssensoren (optioneel)",
           "capacity_per_device": "Nominale capaciteit per apparaat",
-          "balance_threshold": "Maximaal toegestaan SoC-verschil"
+          "balance_threshold": "Maximaal toegestaan SoC-verschil",
+          "pack_input_entities": "Pack input power-sensoren",
+          "pack_output_entities": "Pack output power-sensoren"
         },
         "data_description": {
           "soc_entities": "Selecteer één SoC-sensor per SolarFlow.",
           "power_entities": "Selecteer één vermogenssensor per SolarFlow. Controleer later de tekenrichting.",
           "capacity_per_device": "Voor één SF2400 Pro met één accu is dit normaal 2400 Wh.",
-          "balance_threshold": "De accu's gelden als in balans wanneer het verschil niet groter is dan deze waarde."
+          "balance_threshold": "De accu's gelden als in balans wanneer het verschil niet groter is dan deze waarde.",
+          "pack_input_entities": "Selecteer één packInputPower-sensor per SolarFlow.",
+          "pack_output_entities": "Selecteer één outputPackPower-sensor per SolarFlow."
         }
       }
     },
