@@ -13,6 +13,8 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_BALANCE_THRESHOLD,
     CONF_CAPACITY_PER_DEVICE,
+    CONF_PACK_INPUT_ENTITIES,
+    CONF_PACK_OUTPUT_ENTITIES,
     CONF_POWER_ENTITIES,
     CONF_SOC_ENTITIES,
     DEFAULT_BALANCE_THRESHOLD,
@@ -53,6 +55,24 @@ class HomeEnergyManagerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 ),
                 vol.Optional(
                     CONF_POWER_ENTITIES,
+                    default=[],
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain="sensor",
+                        multiple=True,
+                    )
+                ),
+                vol.Optional(
+                    CONF_PACK_INPUT_ENTITIES,
+                    default=[],
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain="sensor",
+                        multiple=True,
+                    )
+                ),
+                vol.Optional(
+                    CONF_PACK_OUTPUT_ENTITIES,
                     default=[],
                 ): selector.EntitySelector(
                     selector.EntitySelectorConfig(
