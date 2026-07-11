@@ -58,20 +58,21 @@ async def async_setup_entry(
 ) -> None:
     """Set up Home Energy Manager sensors."""
     soc_entities = list(entry.data[CONF_SOC_ENTITIES])
-power_entities = list(entry.data.get(CONF_POWER_ENTITIES, []))
-pack_input_entities = list(
-    entry.data.get(CONF_PACK_INPUT_ENTITIES, [])
-)
-pack_output_entities = list(
-    entry.data.get(CONF_PACK_OUTPUT_ENTITIES, [])
-)
+    power_entities = list(entry.data.get(CONF_POWER_ENTITIES, []))
+    pack_input_entities = list(
+        entry.data.get(CONF_PACK_INPUT_ENTITIES, [])
+    )
+    pack_output_entities = list(
+        entry.data.get(CONF_PACK_OUTPUT_ENTITIES, [])
+    )
 
-source_entities = (
-    set(soc_entities)
-    | set(power_entities)
-    | set(pack_input_entities)
-    | set(pack_output_entities)
-)
+    source_entities = (
+        set(soc_entities)
+        | set(power_entities)
+        | set(pack_input_entities)
+        | set(pack_output_entities)
+    )
+
     entities: list[SensorEntity] = [
         VirtualSocSensor(entry, source_entities, soc_entities),
         VirtualCapacitySensor(entry, source_entities, soc_entities),
@@ -80,7 +81,12 @@ source_entities = (
         AvailableEnergySensor(entry, source_entities, soc_entities),
         BalanceSpreadSensor(entry, source_entities, soc_entities),
         OnlineDevicesSensor(entry, source_entities, soc_entities),
-        VirtualStatusSensor(entry, source_entities, soc_entities, power_entities),
+        VirtualStatusSensor(
+            entry,
+            source_entities,
+            soc_entities,
+            power_entities,
+        ),
     ]
 
     if pack_input_entities and pack_output_entities:
@@ -95,11 +101,14 @@ source_entities = (
 
     if power_entities:
         entities.append(
-            VirtualPowerSensor(entry, source_entities, power_entities)
+            VirtualPowerSensor(
+                entry,
+                source_entities,
+                power_entities,
+            )
         )
 
     async_add_entities(entities)
-
 
 class BaseSensor(HomeEnergyManagerEntity, SensorEntity):
     """Base sensor."""

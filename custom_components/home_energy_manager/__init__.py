@@ -17,7 +17,7 @@ class HomeEnergyManagerRuntimeData:
     source_entities: set[str]
 
 
-type HomeEnergyManagerConfigEntry = ConfigEntry[HomeEnergyManagerRuntimeData]
+HomeEnergyManagerConfigEntry = ConfigEntry[HomeEnergyManagerRuntimeData]
 
 
 async def async_setup_entry(
