@@ -1,0 +1,12 @@
+{
+  "domain": "home_energy_manager",
+  "name": "Home Energy Manager",
+  "codeowners": [],
+  "config_flow": true,
+  "documentation": "https://github.com/placeholder/home-energy-manager",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.2.1"
+}
