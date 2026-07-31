@@ -64,7 +64,7 @@ class ZendureMqttManager:
 
         self._unsubscribers.append(unsubscribe)
 
-        _LOGGER.warning(
+        _LOGGER.info(
             "Zendure MQTT manager gestart en luistert naar %s",
             topic,
         )
@@ -105,7 +105,7 @@ class ZendureMqttManager:
         for listener in list(self._listeners):
             listener()
 
-        _LOGGER.warning(
+        _LOGGER.debug(
             "Zendure MQTT ontvangen: apparaat=%s, meting=%s, waarde=%s",
             device_id,
             measurement,
@@ -146,23 +146,79 @@ class ZendureMqttManager:
         """Return a cached MQTT value."""
         return self.values.get(device_id, {}).get(measurement)
 
-    def sum_measurement(self, measurement: str) -> float:
-        """Return the sum of a measurement for all known devices."""
-        total = 0.0
+    def get_numeric_values(self, measurement: str) -> list[float]:
+        """Return all valid numeric values for a measurement."""
+        values: list[float] = []
 
         for device_values in self.values.values():
             value = device_values.get(measurement)
 
             try:
-                total += float(value)
+                values.append(float(value))
             except (TypeError, ValueError):
                 continue
 
-        return total
+        return values
+
+    def sum_measurement(self, measurement: str) -> float:
+        """Return the sum of a measurement for all known devices."""
+        return sum(self.get_numeric_values(measurement))
+
+    def average_measurement(self, measurement: str) -> float | None:
+        """Return the average of a measurement for all known devices."""
+        values = self.get_numeric_values(measurement)
+
+        if not values:
+            return None
+
+        return sum(values) / len(values)
+
+    def min_measurement(self, measurement: str) -> float | None:
+        """Return the lowest value of a measurement."""
+        values = self.get_numeric_values(measurement)
+
+        if not values:
+            return None
+
+        return min(values)
+
+    def max_measurement(self, measurement: str) -> float | None:
+        """Return the highest value of a measurement."""
+        values = self.get_numeric_values(measurement)
+
+        if not values:
+            return None
+
+        return max(values)
+
+    def count_measurement(self, measurement: str) -> int:
+        """Return the number of devices with a valid measurement."""
+        return len(self.get_numeric_values(measurement))
+
+    def get_text_values(self, measurement: str) -> list[str]:
+        """Return all non-empty text values for a measurement."""
+        values: list[str] = []
+
+        for device_values in self.values.values():
+            value = device_values.get(measurement)
+
+            if value is None:
+                continue
+
+            text_value = str(value).strip()
+
+            if text_value:
+                values.append(text_value)
+
+        return values
 
     def get_device_ids(self) -> set[str]:
         """Return all detected Zendure device IDs."""
         return set(self.values)
+
+    def get_device_count(self) -> int:
+        """Return the number of detected Zendure devices."""
+        return len(self.values)
 
     async def async_stop(self) -> None:
         """Stop all Zendure MQTT subscriptions."""
@@ -172,7 +228,7 @@ class ZendureMqttManager:
         self._unsubscribers.clear()
         self._listeners.clear()
 
-        _LOGGER.warning("Zendure MQTT manager gestopt")
+        _LOGGER.info("Zendure MQTT manager gestopt")
 
 
 @dataclass(slots=True)
