@@ -467,7 +467,9 @@ class VirtualStatusSensor(BaseSensor):
     @property
     def native_value(self) -> str:
         device_count = self.mqtt_manager.get_device_count()
-        soc_count = self.mqtt_manager.count_measurement("electricLevel")
+        soc_count = self.mqtt_manager.count_measurement(
+            "electricLevel"
+        )
 
         if device_count == 0:
             return "unknown"
@@ -475,33 +477,55 @@ class VirtualStatusSensor(BaseSensor):
         if soc_count < device_count:
             return "degraded"
 
-        states = [
-            state.lower()
-            for state in self.mqtt_manager.get_text_values("packState")
-        ]
+        charge_power = self.mqtt_manager.sum_measurement(
+            "outputPackPower"
+        )
+        discharge_power = self.mqtt_manager.sum_measurement(
+            "packInputPower"
+        )
 
-        if any("charg" in state for state in states):
+        net_power = charge_power - discharge_power
+
+        if net_power > 10:
             return "charging"
 
-        if any("discharg" in state for state in states):
+        if net_power < -10:
             return "discharging"
 
-        charge = self.mqtt_manager.sum_measurement("outputPackPower")
-        discharge = self.mqtt_manager.sum_measurement("packInputPower")
+        states = {
+            state.strip().lower()
+            for state in self.mqtt_manager.get_text_values(
+                "packState"
+            )
+        }
 
-        if charge > 10:
+        if "discharging" in states:
+            return "discharging"
+
+        if "charging" in states:
             return "charging"
-
-        if discharge > 10:
-            return "discharging"
 
         return "idle"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        charge_power = self.mqtt_manager.sum_measurement(
+            "outputPackPower"
+        )
+        discharge_power = self.mqtt_manager.sum_measurement(
+            "packInputPower"
+        )
+
         return {
             "pack_states": self.mqtt_manager.get_text_values(
                 "packState"
             ),
+            "laadvermogen": round(charge_power, 1),
+            "ontlaadvermogen": round(discharge_power, 1),
+            "netto_vermogen": round(
+                charge_power - discharge_power,
+                1,
+            ),
             "bron": "directe MQTT-cache",
         }
+
