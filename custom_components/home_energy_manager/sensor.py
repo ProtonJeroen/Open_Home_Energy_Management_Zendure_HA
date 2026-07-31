@@ -99,6 +99,15 @@ async def async_setup_entry(
             )
         )
 
+    if pack_output_entities:
+        entities.append(
+            TotalChargePowerSensor(
+                entry,
+                source_entities,
+                pack_output_entities,
+            )
+        )
+    
     if power_entities:
         entities.append(
             VirtualPowerSensor(
@@ -313,6 +322,43 @@ class NetBatteryPowerSensor(BaseSensor):
             "tekenrichting": "positief = laden, negatief = ontladen",
             "pack_input_entiteiten": self._pack_input_entities,
             "pack_output_entiteiten": self._pack_output_entities,
+        }
+
+
+class TotalChargePowerSensor(BaseSensor):
+    """Total power currently charging all battery packs."""
+
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-plus"
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        source_entities: set[str],
+        output_pack_entities: list[str],
+    ) -> None:
+        """Initialize the total charge power sensor."""
+        super().__init__(
+            entry,
+            source_entities,
+            "total_charge_power",
+            "Totaal laadvermogen",
+        )
+        self._output_pack_entities = output_pack_entities
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the total charging power from all Zendure devices."""
+        mqtt_manager = self._entry.runtime_data.mqtt_manager
+        value = mqtt_manager.sum_measurement("outputPackPower")
+        return round(value, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "bron_entiteiten": self._output_pack_entities,
         }
         
         
