@@ -10,12 +10,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import (
-    CONF_BALANCE_THRESHOLD,
-    CONF_SOC_ENTITIES,
-)
+from .const import CONF_BALANCE_THRESHOLD
 from .entity import HomeEnergyManagerEntity
-from .sensor import _numeric_states
 
 
 async def async_setup_entry(
@@ -24,13 +20,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up Home Energy Manager binary sensors."""
-    soc_entities = list(entry.data[CONF_SOC_ENTITIES])
-    source_entities = set(soc_entities)
+    source_entities: set[str] = set()
 
     async_add_entities(
         [
-            AllOnlineBinarySensor(entry, source_entities, soc_entities),
-            BalancedBinarySensor(entry, source_entities, soc_entities),
+            AllOnlineBinarySensor(entry, source_entities),
+            BalancedBinarySensor(entry, source_entities),
         ]
     )
 
@@ -50,21 +45,30 @@ class BaseBinarySensor(HomeEnergyManagerEntity, BinarySensorEntity):
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_name = name
 
+    @property
+    def mqtt_manager(self):
+        """Return the shared Zendure MQTT manager."""
+        return self._entry.runtime_data.mqtt_manager
+
 
 class AllOnlineBinarySensor(BaseBinarySensor):
     """Whether all configured batteries are available."""
 
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
 
-    def __init__(self, entry, source_entities, soc_entities) -> None:
+    def __init__(self, entry, source_entities) -> None:
         super().__init__(entry, source_entities, "all_online", "Alle accu's online")
-        self._soc_entities = soc_entities
 
     @property
     def is_on(self) -> bool:
+        device_count = self.mqtt_manager.get_device_count()
+
+        if device_count == 0:
+            return False
+
         return (
-            len(_numeric_states(self.hass, self._soc_entities))
-            == len(self._soc_entities)
+            self.mqtt_manager.count_measurement("electricLevel")
+            == device_count
         )
 
 
@@ -73,14 +77,31 @@ class BalancedBinarySensor(BaseBinarySensor):
 
     _attr_icon = "mdi:scale-balance"
 
-    def __init__(self, entry, source_entities, soc_entities) -> None:
+    def __init__(self, entry, source_entities) -> None:
         super().__init__(entry, source_entities, "balanced", "Accu's in balans")
-        self._soc_entities = soc_entities
         self._threshold = float(entry.data[CONF_BALANCE_THRESHOLD])
 
     @property
     def is_on(self) -> bool | None:
-        values = _numeric_states(self.hass, self._soc_entities)
-        if len(values) != len(self._soc_entities):
+        device_count = self.mqtt_manager.get_device_count()
+        values = self.mqtt_manager.get_numeric_values("electricLevel")
+
+        if device_count == 0 or len(values) != device_count:
             return None
+
         return (max(values) - min(values)) <= self._threshold
+
+    @property
+    def extra_state_attributes(self) -> dict[str, float | int]:
+        values = self.mqtt_manager.get_numeric_values("electricLevel")
+
+        return {
+            "drempel": self._threshold,
+            "soc_verschil": (
+                round(max(values) - min(values), 1)
+                if len(values) >= 2
+                else 0.0
+            ),
+            "beschikbare_accus": len(values),
+            "gedetecteerde_accus": self.mqtt_manager.get_device_count(),
+        }
