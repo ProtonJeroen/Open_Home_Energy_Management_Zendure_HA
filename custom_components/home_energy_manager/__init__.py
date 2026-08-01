@@ -21,11 +21,38 @@ MqttValue: TypeAlias = float | str | None
 ZENDURE_BASE_TOPIC = "Zendure/sensor"
 
 ZENDURE_MEASUREMENTS = {
+    # Main SolarFlow measurements
     "outputPackPower",
     "packInputPower",
     "outputHomePower",
+    "gridInputPower",
+    "gridOffPower",
+    "solarInputPower",
+    "solarPower1",
+    "solarPower2",
+    "solarPower3",
+    "solarPower4",
     "electricLevel",
     "packState",
+    "hyperTmp",
+    "heatState",
+    "socStatus",
+    "remainOutTime",
+
+    # Battery-pack measurements
+    "maxTemp",
+    "minVol",
+    "maxVol",
+    "totalVol",
+    "batcur",
+    "softVersion",
+}
+
+TEXT_MEASUREMENTS = {
+    "packState",
+    "heatState",
+    "socStatus",
+    "softVersion",
 }
 
 
@@ -118,7 +145,7 @@ class ZendureMqttManager:
         payload: str,
     ) -> MqttValue:
         """Convert an MQTT payload to the appropriate value."""
-        if measurement == "packState":
+        if measurement in TEXT_MEASUREMENTS:
             return str(payload).strip()
 
         try:
@@ -212,13 +239,26 @@ class ZendureMqttManager:
 
         return values
 
-    def get_device_ids(self) -> set[str]:
-        """Return all detected Zendure device IDs."""
+    def get_all_source_ids(self) -> set[str]:
+        """Return every detected Zendure MQTT source ID."""
         return set(self.values)
 
+    def get_device_ids(self) -> set[str]:
+        """Return detected main SolarFlow device IDs.
+
+        Battery-pack source IDs are excluded so pack telemetry does not
+        increase the virtual battery device count.
+        """
+        return {
+            source_id
+            for source_id, measurements in self.values.items()
+            if "electricLevel" in measurements
+            or "packState" in measurements
+        }
+
     def get_device_count(self) -> int:
-        """Return the number of detected Zendure devices."""
-        return len(self.values)
+        """Return the number of detected main SolarFlow devices."""
+        return len(self.get_device_ids())
 
     async def async_stop(self) -> None:
         """Stop all Zendure MQTT subscriptions."""

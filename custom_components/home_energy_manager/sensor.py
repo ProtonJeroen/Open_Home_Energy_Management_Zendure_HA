@@ -66,6 +66,66 @@ async def async_setup_entry(
         TotalChargePowerSensor(entry, source_entities),
         TotalDischargePowerSensor(entry, source_entities),
         VirtualPowerSensor(entry, source_entities),
+        AggregateMeasurementSensor(
+            entry,
+            source_entities,
+            key="pv_input_power",
+            name="PV-ingangsvermogen",
+            measurement="solarInputPower",
+            aggregation="sum",
+            unit=UnitOfPower.WATT,
+            device_class=SensorDeviceClass.POWER,
+            icon="mdi:solar-power",
+        ),
+        AggregateMeasurementSensor(
+            entry,
+            source_entities,
+            key="ac_input_power",
+            name="AC-ingangsvermogen",
+            measurement="gridInputPower",
+            aggregation="sum",
+            unit=UnitOfPower.WATT,
+            device_class=SensorDeviceClass.POWER,
+            icon="mdi:transmission-tower-import",
+        ),
+        AggregateMeasurementSensor(
+            entry,
+            source_entities,
+            key="home_output_power",
+            name="Vermogen naar huis",
+            measurement="outputHomePower",
+            aggregation="sum",
+            unit=UnitOfPower.WATT,
+            device_class=SensorDeviceClass.POWER,
+            icon="mdi:home-lightning-bolt",
+        ),
+        TextMeasurementSensor(
+            entry,
+            source_entities,
+            key="heating_status",
+            name="Verwarmingsstatus",
+            measurement="heatState",
+            icon="mdi:radiator",
+        ),
+        TextMeasurementSensor(
+            entry,
+            source_entities,
+            key="soc_status",
+            name="SoC-status",
+            measurement="socStatus",
+            icon="mdi:battery-heart-variant",
+        ),
+        AggregateMeasurementSensor(
+            entry,
+            source_entities,
+            key="remaining_output_time",
+            name="Resterende ontlaadtijd",
+            measurement="remainOutTime",
+            aggregation="average",
+            unit=None,
+            device_class=None,
+            icon="mdi:timer-sand",
+        ),
     ]
 
     async_add_entities(entities)
@@ -90,6 +150,102 @@ class BaseSensor(HomeEnergyManagerEntity, SensorEntity):
     def mqtt_manager(self):
         """Return the shared Zendure MQTT manager."""
         return self._entry.runtime_data.mqtt_manager
+
+
+class AggregateMeasurementSensor(BaseSensor):
+    """Generic numeric MQTT measurement sensor."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        source_entities: set[str],
+        *,
+        key: str,
+        name: str,
+        measurement: str,
+        aggregation: str,
+        unit: str | None,
+        device_class: SensorDeviceClass | None,
+        icon: str,
+    ) -> None:
+        """Initialize an aggregate MQTT measurement sensor."""
+        super().__init__(entry, source_entities, key, name)
+        self._measurement = measurement
+        self._aggregation = aggregation
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_icon = icon
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the aggregated MQTT value."""
+        if self._aggregation == "sum":
+            values = self.mqtt_manager.get_numeric_values(self._measurement)
+            return round(sum(values), 2) if values else None
+
+        if self._aggregation == "average":
+            value = self.mqtt_manager.average_measurement(self._measurement)
+        elif self._aggregation == "min":
+            value = self.mqtt_manager.min_measurement(self._measurement)
+        elif self._aggregation == "max":
+            value = self.mqtt_manager.max_measurement(self._measurement)
+        else:
+            return None
+
+        return round(value, 2) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return MQTT source information."""
+        return {
+            "mqtt_meting": self._measurement,
+            "aggregatie": self._aggregation,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement(
+                self._measurement
+            ),
+        }
+
+
+class TextMeasurementSensor(BaseSensor):
+    """Generic text MQTT measurement sensor."""
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        source_entities: set[str],
+        *,
+        key: str,
+        name: str,
+        measurement: str,
+        icon: str,
+    ) -> None:
+        """Initialize a text MQTT measurement sensor."""
+        super().__init__(entry, source_entities, key, name)
+        self._measurement = measurement
+        self._attr_icon = icon
+
+    @property
+    def native_value(self) -> str | None:
+        """Return unique text values."""
+        values = sorted(set(self.mqtt_manager.get_text_values(self._measurement)))
+        return ", ".join(values) if values else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return raw values by MQTT source."""
+        source_values: dict[str, str] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            value = self.mqtt_manager.get_value(source_id, self._measurement)
+            if value is not None:
+                source_values[source_id] = str(value)
+
+        return {
+            "mqtt_meting": self._measurement,
+            "bronwaarden": source_values,
+        }
 
 
 class VirtualSocSensor(BaseSensor):
