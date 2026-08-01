@@ -18,33 +18,6 @@ from .const import CONF_CAPACITY_PER_DEVICE
 from .entity import HomeEnergyManagerEntity
 
 
-def _numeric_states(
-    hass: HomeAssistant,
-    entity_ids: list[str],
-) -> list[float]:
-    """Return valid numeric Home Assistant states.
-
-    Kept temporarily for compatibility with binary_sensor.py.
-    """
-    values: list[float] = []
-
-    for entity_id in entity_ids:
-        state = hass.states.get(entity_id)
-
-        if state is None or state.state in {
-            "unknown",
-            "unavailable",
-        }:
-            continue
-
-        try:
-            values.append(float(state.state))
-        except (TypeError, ValueError):
-            continue
-
-    return values
-
-
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -115,17 +88,7 @@ async def async_setup_entry(
             measurement="socStatus",
             icon="mdi:battery-heart-variant",
         ),
-        AggregateMeasurementSensor(
-            entry,
-            source_entities,
-            key="remaining_output_time",
-            name="Resterende ontlaadtijd",
-            measurement="remainOutTime",
-            aggregation="average",
-            unit=None,
-            device_class=None,
-            icon="mdi:timer-sand",
-        ),
+        RemainingOutputTimeSensor(entry, source_entities),
     ]
 
     async_add_entities(entities)
@@ -245,6 +208,61 @@ class TextMeasurementSensor(BaseSensor):
         return {
             "mqtt_meting": self._measurement,
             "bronwaarden": source_values,
+        }
+
+
+class RemainingOutputTimeSensor(BaseSensor):
+    """Average estimated remaining discharge time."""
+
+    _attr_icon = "mdi:timer-sand"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "remaining_output_time",
+            "Resterende ontlaadtijd",
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        minutes = self.mqtt_manager.average_measurement(
+            "remainOutTime"
+        )
+
+        if minutes is None:
+            return None
+
+        total_minutes = max(0, round(minutes))
+        hours, remaining_minutes = divmod(total_minutes, 60)
+
+        if hours:
+            return f"{hours} u {remaining_minutes:02d} min"
+
+        return f"{remaining_minutes} min"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        minutes = self.mqtt_manager.average_measurement(
+            "remainOutTime"
+        )
+
+        if minutes is None:
+            return {
+                "mqtt_meting": "remainOutTime",
+                "eenheid_bron": "minuten",
+            }
+
+        total_minutes = max(0, round(minutes))
+
+        return {
+            "mqtt_meting": "remainOutTime",
+            "eenheid_bron": "minuten",
+            "gemiddeld_aantal_minuten": total_minutes,
+            "gemiddeld_aantal_uren": round(total_minutes / 60, 2),
+            "beschikbare_waarden": self.mqtt_manager.count_measurement(
+                "remainOutTime"
+            ),
         }
 
 
