@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
+    RestoreSensor,
     SensorEntity,
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import CONF_CAPACITY_PER_DEVICE
@@ -38,6 +41,8 @@ async def async_setup_entry(
         NetBatteryPowerSensor(entry, source_entities),
         TotalChargePowerSensor(entry, source_entities),
         TotalDischargePowerSensor(entry, source_entities),
+        TotalChargedEnergySensor(entry, source_entities),
+        TotalDischargedEnergySensor(entry, source_entities),
         VirtualPowerSensor(entry, source_entities),
         AggregateMeasurementSensor(
             entry,
@@ -525,6 +530,145 @@ class TotalDischargePowerSensor(BaseSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"mqtt_meting": "packInputPower"}
+
+
+class CumulativeEnergySensor(
+    HomeEnergyManagerEntity,
+    RestoreSensor,
+):
+    """Integrate an MQTT power measurement into persistent energy."""
+
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_suggested_display_precision = 3
+
+    # Do not bridge long MQTT/restart gaps into artificial energy.
+    _maximum_interval_seconds = 300.0
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        source_entities: set[str],
+        *,
+        key: str,
+        name: str,
+        measurement: str,
+        icon: str,
+    ) -> None:
+        """Initialize a cumulative energy sensor."""
+        super().__init__(entry, source_entities)
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_name = name
+        self._attr_icon = icon
+        self._measurement = measurement
+        self._attr_native_value = 0.0
+        self._last_sample_time: datetime | None = None
+        self._last_power_w: float | None = None
+
+    @property
+    def mqtt_manager(self):
+        """Return the shared Zendure MQTT manager."""
+        return self._entry.runtime_data.mqtt_manager
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the total and start a fresh integration interval."""
+        await super().async_added_to_hass()
+
+        last_state = await self.async_get_last_sensor_data()
+
+        if last_state is not None:
+            try:
+                restored_value = float(last_state.native_value)
+            except (TypeError, ValueError):
+                restored_value = 0.0
+
+            self._attr_native_value = max(0.0, restored_value)
+
+        self._last_sample_time = dt_util.utcnow()
+        self._last_power_w = self._current_power()
+
+    def _current_power(self) -> float:
+        """Return current non-negative power for this energy direction."""
+        return max(
+            0.0,
+            self.mqtt_manager.sum_measurement(self._measurement),
+        )
+
+    @callback
+    def _async_mqtt_value_changed(self) -> None:
+        """Integrate elapsed power and publish the updated total."""
+        now = dt_util.utcnow()
+        current_power_w = self._current_power()
+
+        if (
+            self._last_sample_time is not None
+            and self._last_power_w is not None
+        ):
+            elapsed_seconds = (
+                now - self._last_sample_time
+            ).total_seconds()
+
+            if 0.0 < elapsed_seconds <= self._maximum_interval_seconds:
+                average_power_w = (
+                    self._last_power_w + current_power_w
+                ) / 2.0
+
+                added_kwh = (
+                    average_power_w
+                    * elapsed_seconds
+                    / 3_600_000.0
+                )
+
+                self._attr_native_value = round(
+                    float(self._attr_native_value or 0.0)
+                    + added_kwh,
+                    6,
+                )
+
+        self._last_sample_time = now
+        self._last_power_w = current_power_w
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return integration information."""
+        return {
+            "mqtt_meting": self._measurement,
+            "berekening": "trapeziumintegratie van vermogen",
+            "bronvermogen_w": round(self._current_power(), 1),
+            "maximale_interval_seconden": (
+                self._maximum_interval_seconds
+            ),
+        }
+
+
+class TotalChargedEnergySensor(CumulativeEnergySensor):
+    """Total energy charged into the virtual battery."""
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            key="total_charged_energy",
+            name="Totale geladen energie",
+            measurement="outputPackPower",
+            icon="mdi:battery-arrow-up",
+        )
+
+
+class TotalDischargedEnergySensor(CumulativeEnergySensor):
+    """Total energy discharged from the virtual battery."""
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            key="total_discharged_energy",
+            name="Totale ontladen energie",
+            measurement="packInputPower",
+            icon="mdi:battery-arrow-down",
+        )
 
 
 class VirtualPowerSensor(BaseSensor):
