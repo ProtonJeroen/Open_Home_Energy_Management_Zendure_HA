@@ -4,16 +4,50 @@ from __future__ import annotations
 
 from homeassistant.components.number import NumberDeviceClass, NumberEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfPower
+from homeassistant.const import PERCENTAGE, UnitOfPower
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import DOMAIN
 
-POWER_LIMIT_SETTINGS = {
-    "inputLimit": ("Input limit", "mdi:battery-arrow-down"),
-    "outputLimit": ("Output limit", "mdi:battery-arrow-up"),
+NUMBER_SETTINGS = {
+    "inputLimit": {
+        "name": "Input limit",
+        "icon": "mdi:battery-arrow-down",
+        "device_class": NumberDeviceClass.POWER,
+        "unit": UnitOfPower.WATT,
+        "min": 0.0,
+        "max": 2400.0,
+        "step": 1.0,
+    },
+    "outputLimit": {
+        "name": "Output limit",
+        "icon": "mdi:battery-arrow-up",
+        "device_class": NumberDeviceClass.POWER,
+        "unit": UnitOfPower.WATT,
+        "min": 0.0,
+        "max": 2400.0,
+        "step": 1.0,
+    },
+    "minSoc": {
+        "name": "Minimum SoC",
+        "icon": "mdi:battery-low",
+        "device_class": None,
+        "unit": PERCENTAGE,
+        "min": 5.0,
+        "max": 50.0,
+        "step": 1.0,
+    },
+    "socSet": {
+        "name": "Doel-SoC",
+        "icon": "mdi:battery-check",
+        "device_class": None,
+        "unit": PERCENTAGE,
+        "min": 70.0,
+        "max": 100.0,
+        "step": 1.0,
+    },
 }
 
 
@@ -22,17 +56,17 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up physical SolarFlow power-limit controls."""
+    """Set up physical SolarFlow number controls."""
     manager = entry.runtime_data.mqtt_manager
     known_entities: set[tuple[str, str]] = set()
 
     @callback
     def async_add_missing_entities() -> None:
         """Create controls when supported MQTT values are discovered."""
-        new_entities: list[SolarFlowPowerLimitNumber] = []
+        new_entities: list[SolarFlowNumber] = []
 
         for device_id, values in manager.number_values.items():
-            for setting in POWER_LIMIT_SETTINGS:
+            for setting in NUMBER_SETTINGS:
                 key = (device_id, setting)
 
                 if key in known_entities or setting not in values:
@@ -40,7 +74,7 @@ async def async_setup_entry(
 
                 known_entities.add(key)
                 new_entities.append(
-                    SolarFlowPowerLimitNumber(
+                    SolarFlowNumber(
                         entry,
                         device_id,
                         setting,
@@ -58,15 +92,10 @@ async def async_setup_entry(
     async_add_missing_entities()
 
 
-class SolarFlowPowerLimitNumber(NumberEntity):
-    """Control one power limit of one physical SolarFlow."""
+class SolarFlowNumber(NumberEntity):
+    """Control one numeric setting of one physical SolarFlow."""
 
     _attr_has_entity_name = True
-    _attr_device_class = NumberDeviceClass.POWER
-    _attr_native_unit_of_measurement = UnitOfPower.WATT
-    _attr_native_min_value = 0.0
-    _attr_native_max_value = 2400.0
-    _attr_native_step = 1.0
     _attr_mode = "slider"
 
     def __init__(
@@ -75,19 +104,22 @@ class SolarFlowPowerLimitNumber(NumberEntity):
         device_id: str,
         setting: str,
     ) -> None:
-        """Initialize a SolarFlow power-limit number."""
+        """Initialize a SolarFlow number control."""
         self._entry = entry
         self._device_id = device_id
         self._setting = setting
 
-        name, icon = POWER_LIMIT_SETTINGS[setting]
+        config = NUMBER_SETTINGS[setting]
         short_id = device_id[-6:]
 
-        self._attr_unique_id = (
-            f"{entry.entry_id}_{device_id}_{setting}"
-        )
-        self._attr_name = f"{name} {short_id}"
-        self._attr_icon = icon
+        self._attr_unique_id = f"{entry.entry_id}_{device_id}_{setting}"
+        self._attr_name = f"{config['name']} {short_id}"
+        self._attr_icon = config["icon"]
+        self._attr_device_class = config["device_class"]
+        self._attr_native_unit_of_measurement = config["unit"]
+        self._attr_native_min_value = config["min"]
+        self._attr_native_max_value = config["max"]
+        self._attr_native_step = config["step"]
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device_id)},
@@ -116,7 +148,7 @@ class SolarFlowPowerLimitNumber(NumberEntity):
             return None
 
     async def async_set_native_value(self, value: float) -> None:
-        """Set the physical SolarFlow power limit."""
+        """Set the physical SolarFlow numeric setting."""
         value = max(
             self.native_min_value,
             min(self.native_max_value, value),
