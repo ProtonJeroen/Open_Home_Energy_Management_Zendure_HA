@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
+from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -94,6 +94,7 @@ async def async_setup_entry(
             measurement="socStatus",
             icon="mdi:battery-heart-variant",
         ),
+        MaxBatteryTemperatureSensor(entry, source_entities),
         RemainingOutputTimeSensor(entry, source_entities),
     ]
 
@@ -214,6 +215,72 @@ class TextMeasurementSensor(BaseSensor):
         return {
             "mqtt_meting": self._measurement,
             "bronwaarden": source_values,
+        }
+
+
+class MaxBatteryTemperatureSensor(BaseSensor):
+    """Highest battery-pack temperature reported by Zendure."""
+
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer-high"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "max_battery_temperature",
+            "Hoogste batterijtemperatuur",
+        )
+
+    @staticmethod
+    def _to_celsius(value: float) -> float:
+        """Convert Zendure maxTemp to degrees Celsius.
+
+        Observed Zendure values such as 308.1 correspond to 34.95 °C,
+        so maxTemp is treated as Kelvin.
+        """
+        return value - 273.15
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the highest reported battery temperature in °C."""
+        values = self.mqtt_manager.get_numeric_values("maxTemp")
+
+        if not values:
+            return None
+
+        return round(
+            max(self._to_celsius(value) for value in values),
+            1,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return raw maxTemp values for validation."""
+        source_values: dict[str, dict[str, float]] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            raw = self.mqtt_manager.get_value(source_id, "maxTemp")
+
+            try:
+                raw_value = float(raw)
+            except (TypeError, ValueError):
+                continue
+
+            source_values[source_id] = {
+                "raw_kelvin": raw_value,
+                "celsius": round(self._to_celsius(raw_value), 1),
+            }
+
+        return {
+            "mqtt_meting": "maxTemp",
+            "omrekening": "K - 273.15",
+            "bronwaarden": source_values,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement(
+                "maxTemp"
+            ),
         }
 
 

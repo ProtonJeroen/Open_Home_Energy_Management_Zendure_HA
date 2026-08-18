@@ -140,6 +140,16 @@ class ZendureMqttManager:
         device_id = topic_parts[2]
         key = topic_parts[3]
 
+        # Zendure battery-pack topics sometimes repeat the device ID
+        # in the measurement name, for example:
+        # Zendure/sensor/JO2AEP1P0402415/JO2AEP1P0402415_maxTemp
+        #
+        # Normalize that to "maxTemp" so BMS measurements use the same
+        # internal keys as the main SolarFlow measurements.
+        prefixed_key = f"{device_id}_"
+        if category == "sensor" and key.startswith(prefixed_key):
+            key = key[len(prefixed_key):]
+
         if category == "sensor":
             if key not in ZENDURE_MEASUREMENTS:
                 return
@@ -235,41 +245,6 @@ class ZendureMqttManager:
     ) -> MqttValue:
         """Return a cached Zendure number setting."""
         return self.number_values.get(device_id, {}).get(setting)
-
-    async def async_set_number_value(
-        self,
-        device_id: str,
-        setting: str,
-        value: float,
-    ) -> None:
-        """Publish a Zendure number command."""
-        if setting not in ZENDURE_NUMBER_SETTINGS:
-            raise ValueError(
-                f"Unsupported Zendure number setting: {setting}"
-            )
-
-        topic = (
-            f"{ZENDURE_NUMBER_TOPIC}/"
-            f"{device_id}/{setting}/set"
-        )
-
-        payload = str(int(value)) if float(value).is_integer() else str(value)
-
-        await mqtt.async_publish(
-            self.hass,
-            topic,
-            payload,
-            qos=0,
-            retain=False,
-        )
-
-        _LOGGER.info(
-            "Zendure MQTT number opdracht verzonden: "
-            "apparaat=%s, setting=%s, waarde=%s",
-            device_id,
-            setting,
-            payload,
-        )
 
     def get_switch_value(
         self,
