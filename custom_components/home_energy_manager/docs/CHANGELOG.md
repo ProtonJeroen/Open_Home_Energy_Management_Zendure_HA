@@ -1,5 +1,9 @@
 # Changelog
 
+
+
+## Zendure Firmware update results in MQTT down when Hems is active (18-08-2026)
+
 ## v0.4.0
 
 - Directe MQTT-besturing van fysieke Zendure SolarFlow-units
