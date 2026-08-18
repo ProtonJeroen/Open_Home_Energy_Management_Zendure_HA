@@ -12,12 +12,13 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower
+from homeassistant.const import PERCENTAGE, UnitOfElectricPotential, UnitOfEnergy, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import CONF_CAPACITY_PER_DEVICE
+from .const import CONF_CAPACITY_PER_DEVICE, DOMAIN
 from .entity import HomeEnergyManagerEntity
 
 
@@ -38,12 +39,14 @@ async def async_setup_entry(
         BalanceSpreadSensor(entry, source_entities),
         OnlineDevicesSensor(entry, source_entities),
         VirtualStatusSensor(entry, source_entities),
+        PackStatusSensor(entry, source_entities),
         NetBatteryPowerSensor(entry, source_entities),
         TotalChargePowerSensor(entry, source_entities),
         TotalDischargePowerSensor(entry, source_entities),
         TotalChargedEnergySensor(entry, source_entities),
         TotalDischargedEnergySensor(entry, source_entities),
         VirtualPowerSensor(entry, source_entities),
+        MqttControlsDiagnosticSensor(entry, source_entities),
         AggregateMeasurementSensor(
             entry,
             source_entities,
@@ -93,10 +96,143 @@ async def async_setup_entry(
             measurement="socStatus",
             icon="mdi:battery-heart-variant",
         ),
+        MaxBatteryTemperatureSensor(entry, source_entities),
+        HighestCellVoltageSensor(entry, source_entities),
+        LowestCellVoltageSensor(entry, source_entities),
+        CellVoltageSpreadSensor(entry, source_entities),
         RemainingOutputTimeSensor(entry, source_entities),
     ]
 
     async_add_entities(entities)
+
+    manager = entry.runtime_data.mqtt_manager
+    known_pv_entities: set[tuple[str, str]] = set()
+
+    @callback
+    def async_add_missing_pv_entities() -> None:
+        """Create per-SolarFlow PV sensors when MQTT data is discovered."""
+        new_entities: list[SensorEntity] = []
+
+        for device_id in sorted(manager.get_device_ids()):
+            device_values = manager.values.get(device_id, {})
+
+            for measurement, name, icon in (
+                ("solarPower1", "PV ingang 1", "mdi:solar-panel"),
+                ("solarPower2", "PV ingang 2", "mdi:solar-panel"),
+                ("solarPower3", "PV ingang 3", "mdi:solar-panel"),
+                ("solarPower4", "PV ingang 4", "mdi:solar-panel"),
+                (
+                    "solarInputPower",
+                    "Totaal PV-ingangsvermogen",
+                    "mdi:solar-power",
+                ),
+            ):
+                key = (device_id, measurement)
+
+                if key in known_pv_entities:
+                    continue
+
+                if measurement not in device_values:
+                    continue
+
+                known_pv_entities.add(key)
+                new_entities.append(
+                    SolarFlowPvPowerSensor(
+                        entry,
+                        device_id,
+                        measurement,
+                        name,
+                        icon,
+                    )
+                )
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+    remove_listener = manager.async_add_listener(
+        async_add_missing_pv_entities
+    )
+    entry.async_on_unload(remove_listener)
+
+    async_add_missing_pv_entities()
+
+
+class SolarFlowPvPowerSensor(SensorEntity):
+    """Power sensor for one physical SolarFlow PV input."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        device_id: str,
+        measurement: str,
+        name: str,
+        icon: str,
+    ) -> None:
+        """Initialize a physical SolarFlow PV sensor."""
+        self._entry = entry
+        self._device_id = device_id
+        self._measurement = measurement
+
+        short_id = device_id[-6:]
+        self._attr_unique_id = (
+            f"{entry.entry_id}_{device_id}_{measurement}"
+        )
+        self._attr_name = f"{name} {short_id}"
+        self._attr_icon = icon
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, device_id)},
+            name=f"SolarFlow {short_id}",
+            manufacturer="Zendure",
+            model="SolarFlow 2400 Pro",
+            via_device=(DOMAIN, entry.entry_id),
+        )
+
+    @property
+    def mqtt_manager(self):
+        """Return the shared Zendure MQTT manager."""
+        return self._entry.runtime_data.mqtt_manager
+
+    @property
+    def native_value(self) -> float | None:
+        """Return current PV power from direct MQTT feedback."""
+        value = self.mqtt_manager.get_value(
+            self._device_id,
+            self._measurement,
+        )
+
+        try:
+            return round(float(value), 1)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return MQTT source information."""
+        return {
+            "mqtt_meting": self._measurement,
+            "solarflow_id": self._device_id,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to MQTT cache updates."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.mqtt_manager.async_add_listener(
+                self._async_mqtt_updated
+            )
+        )
+
+    @callback
+    def _async_mqtt_updated(self) -> None:
+        """Write MQTT feedback to Home Assistant."""
+        self.async_write_ha_state()
 
 
 class BaseSensor(HomeEnergyManagerEntity, SensorEntity):
@@ -213,6 +349,206 @@ class TextMeasurementSensor(BaseSensor):
         return {
             "mqtt_meting": self._measurement,
             "bronwaarden": source_values,
+        }
+
+
+class MaxBatteryTemperatureSensor(BaseSensor):
+    """Highest battery-pack temperature reported by Zendure."""
+
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer-high"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "max_battery_temperature",
+            "Hoogste batterijtemperatuur",
+        )
+
+    @staticmethod
+    def _to_celsius(value: float) -> float:
+        """Convert Zendure maxTemp to degrees Celsius.
+
+        Observed Zendure values such as 308.1 correspond to 34.95 °C,
+        so maxTemp is treated as Kelvin.
+        """
+        return value - 273.15
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the highest reported battery temperature in °C."""
+        values = self.mqtt_manager.get_numeric_values("maxTemp")
+
+        if not values:
+            return None
+
+        return round(
+            max(self._to_celsius(value) for value in values),
+            1,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return raw maxTemp values for validation."""
+        source_values: dict[str, dict[str, float]] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            raw = self.mqtt_manager.get_value(source_id, "maxTemp")
+
+            try:
+                raw_value = float(raw)
+            except (TypeError, ValueError):
+                continue
+
+            source_values[source_id] = {
+                "raw_kelvin": raw_value,
+                "celsius": round(self._to_celsius(raw_value), 1),
+            }
+
+        return {
+            "mqtt_meting": "maxTemp",
+            "omrekening": "K - 273.15",
+            "bronwaarden": source_values,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement(
+                "maxTemp"
+            ),
+        }
+
+
+class HighestCellVoltageSensor(BaseSensor):
+    _attr_suggested_display_precision = 2
+    """Highest cell voltage across all battery packs."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-arrow-up"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "highest_cell_voltage",
+            "Hoogste celspanning",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.mqtt_manager.max_measurement("maxVol")
+        return round(value, 3) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        values: dict[str, float] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            raw = self.mqtt_manager.get_value(source_id, "maxVol")
+            try:
+                values[source_id] = round(float(raw), 3)
+            except (TypeError, ValueError):
+                continue
+
+        return {
+            "mqtt_meting": "maxVol",
+            "bronwaarden": values,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement("maxVol"),
+        }
+
+
+class LowestCellVoltageSensor(BaseSensor):
+    _attr_suggested_display_precision = 2
+    """Lowest cell voltage across all battery packs."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-arrow-down"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "lowest_cell_voltage",
+            "Laagste celspanning",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.mqtt_manager.min_measurement("minVol")
+        return round(value, 3) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        values: dict[str, float] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            raw = self.mqtt_manager.get_value(source_id, "minVol")
+            try:
+                values[source_id] = round(float(raw), 3)
+            except (TypeError, ValueError):
+                continue
+
+        return {
+            "mqtt_meting": "minVol",
+            "bronwaarden": values,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement("minVol"),
+        }
+
+
+class CellVoltageSpreadSensor(BaseSensor):
+    _attr_suggested_display_precision = 2
+    """Largest per-pack cell-voltage spread."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:chart-bell-curve-cumulative"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "cell_voltage_spread",
+            "Celspanningsverschil",
+        )
+
+    def _pack_spreads(self) -> dict[str, float]:
+        spreads: dict[str, float] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            min_raw = self.mqtt_manager.get_value(source_id, "minVol")
+            max_raw = self.mqtt_manager.get_value(source_id, "maxVol")
+
+            try:
+                min_value = float(min_raw)
+                max_value = float(max_raw)
+            except (TypeError, ValueError):
+                continue
+
+            spreads[source_id] = max(0.0, max_value - min_value)
+
+        return spreads
+
+    @property
+    def native_value(self) -> float | None:
+        spreads = self._pack_spreads()
+        if not spreads:
+            return None
+        return round(max(spreads.values()), 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        spreads = self._pack_spreads()
+        return {
+            "berekening": "maxVol - minVol per batterijpack",
+            "bronwaarden": {
+                source_id: round(value, 3)
+                for source_id, value in spreads.items()
+            },
+            "beschikbare_packs": len(spreads),
         }
 
 
@@ -445,6 +781,70 @@ class AvailableEnergySensor(_EnergyMixin, BaseSensor):
         return {"reserve_percentage": self.RESERVE_PERCENTAGE}
 
 
+class PackStatusSensor(BaseSensor):
+    """Combined packState status for the physical SolarFlow devices."""
+
+    _attr_icon = "mdi:battery-sync"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "pack_status",
+            "Pack-status",
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        """Return one shared state or 'mixed' when packs differ."""
+        states: list[str] = []
+
+        for device_id in sorted(self.mqtt_manager.get_device_ids()):
+            value = self.mqtt_manager.get_value(device_id, "packState")
+
+            if value is None:
+                continue
+
+            state = str(value).strip().lower()
+            if state:
+                states.append(state)
+
+        if not states:
+            return None
+
+        unique_states = set(states)
+
+        if len(unique_states) == 1:
+            return states[0]
+
+        return "mixed"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the individual pack states and counters."""
+        individual: dict[str, str] = {}
+        counts: dict[str, int] = {}
+
+        for device_id in sorted(self.mqtt_manager.get_device_ids()):
+            value = self.mqtt_manager.get_value(device_id, "packState")
+
+            if value is None:
+                individual[device_id] = "unavailable"
+                continue
+
+            state = str(value).strip().lower() or "unknown"
+            individual[device_id] = state
+            counts[state] = counts.get(state, 0) + 1
+
+        return {
+            "individuele_pack_status": individual,
+            "charging": counts.get("charging", 0),
+            "discharging": counts.get("discharging", 0),
+            "idle": counts.get("idle", 0),
+            "totaal_accus": self.mqtt_manager.get_device_count(),
+        }
+
+
 class NetBatteryPowerSensor(BaseSensor):
     """Net battery power: positive is charging."""
 
@@ -540,7 +940,7 @@ class CumulativeEnergySensor(
 
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 3
 
     # Do not bridge long MQTT/restart gaps into artificial energy.
@@ -620,10 +1020,17 @@ class CumulativeEnergySensor(
                     / 3_600_000.0
                 )
 
-                self._attr_native_value = round(
-                    float(self._attr_native_value or 0.0)
-                    + added_kwh,
+                current_total = float(
+                    self._attr_native_value or 0.0
+                )
+                new_total = round(
+                    current_total + added_kwh,
                     6,
+                )
+
+                self._attr_native_value = max(
+                    current_total,
+                    new_total,
                 )
 
         self._last_sample_time = now
@@ -698,6 +1105,62 @@ class VirtualPowerSensor(BaseSensor):
         return {
             "bron": "directe MQTT-cache",
             "tekenrichting": "positief = laden, negatief = ontladen",
+        }
+
+
+class MqttControlsDiagnosticSensor(BaseSensor):
+    """Diagnostic view of cached Zendure control values."""
+
+    _attr_icon = "mdi:tune-variant"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "mqtt_controls_diagnostic",
+            "Zendure MQTT controls ontvangen",
+        )
+
+    @property
+    def native_value(self) -> int:
+        """Return the number of SolarFlow devices with control data."""
+        device_ids = set(self.mqtt_manager.get_device_ids())
+        device_ids.update(self.mqtt_manager.number_values)
+        device_ids.update(self.mqtt_manager.switch_values)
+        device_ids.update(self.mqtt_manager.select_values)
+
+        return sum(
+            1
+            for device_id in device_ids
+            if any(
+                self.mqtt_manager.get_control_snapshot(device_id).values()
+            )
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return all currently cached control values."""
+        device_ids = set(self.mqtt_manager.get_device_ids())
+        device_ids.update(self.mqtt_manager.number_values)
+        device_ids.update(self.mqtt_manager.switch_values)
+        device_ids.update(self.mqtt_manager.select_values)
+
+        devices: dict[str, dict[str, dict[str, Any]]] = {}
+
+        for device_id in sorted(device_ids):
+            snapshot = self.mqtt_manager.get_control_snapshot(device_id)
+
+            if any(snapshot.values()):
+                devices[device_id] = snapshot
+
+        return {
+            "devices": devices,
+            "aantal_apparaten_met_controls": len(devices),
+            "verwachte_categorieen": [
+                "number",
+                "switch",
+                "select",
+            ],
         }
 
 
