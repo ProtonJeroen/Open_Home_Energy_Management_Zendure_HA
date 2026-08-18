@@ -15,9 +15,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfElectricPotential, UnitOfEnergy, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import CONF_CAPACITY_PER_DEVICE
+from .const import CONF_CAPACITY_PER_DEVICE, DOMAIN
 from .entity import HomeEnergyManagerEntity
 
 
@@ -38,6 +39,7 @@ async def async_setup_entry(
         BalanceSpreadSensor(entry, source_entities),
         OnlineDevicesSensor(entry, source_entities),
         VirtualStatusSensor(entry, source_entities),
+        PackStatusSensor(entry, source_entities),
         NetBatteryPowerSensor(entry, source_entities),
         TotalChargePowerSensor(entry, source_entities),
         TotalDischargePowerSensor(entry, source_entities),
@@ -102,6 +104,135 @@ async def async_setup_entry(
     ]
 
     async_add_entities(entities)
+
+    manager = entry.runtime_data.mqtt_manager
+    known_pv_entities: set[tuple[str, str]] = set()
+
+    @callback
+    def async_add_missing_pv_entities() -> None:
+        """Create per-SolarFlow PV sensors when MQTT data is discovered."""
+        new_entities: list[SensorEntity] = []
+
+        for device_id in sorted(manager.get_device_ids()):
+            device_values = manager.values.get(device_id, {})
+
+            for measurement, name, icon in (
+                ("solarPower1", "PV ingang 1", "mdi:solar-panel"),
+                ("solarPower2", "PV ingang 2", "mdi:solar-panel"),
+                ("solarPower3", "PV ingang 3", "mdi:solar-panel"),
+                ("solarPower4", "PV ingang 4", "mdi:solar-panel"),
+                (
+                    "solarInputPower",
+                    "Totaal PV-ingangsvermogen",
+                    "mdi:solar-power",
+                ),
+            ):
+                key = (device_id, measurement)
+
+                if key in known_pv_entities:
+                    continue
+
+                if measurement not in device_values:
+                    continue
+
+                known_pv_entities.add(key)
+                new_entities.append(
+                    SolarFlowPvPowerSensor(
+                        entry,
+                        device_id,
+                        measurement,
+                        name,
+                        icon,
+                    )
+                )
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+    remove_listener = manager.async_add_listener(
+        async_add_missing_pv_entities
+    )
+    entry.async_on_unload(remove_listener)
+
+    async_add_missing_pv_entities()
+
+
+class SolarFlowPvPowerSensor(SensorEntity):
+    """Power sensor for one physical SolarFlow PV input."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        device_id: str,
+        measurement: str,
+        name: str,
+        icon: str,
+    ) -> None:
+        """Initialize a physical SolarFlow PV sensor."""
+        self._entry = entry
+        self._device_id = device_id
+        self._measurement = measurement
+
+        short_id = device_id[-6:]
+        self._attr_unique_id = (
+            f"{entry.entry_id}_{device_id}_{measurement}"
+        )
+        self._attr_name = f"{name} {short_id}"
+        self._attr_icon = icon
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, device_id)},
+            name=f"SolarFlow {short_id}",
+            manufacturer="Zendure",
+            model="SolarFlow 2400 Pro",
+            via_device=(DOMAIN, entry.entry_id),
+        )
+
+    @property
+    def mqtt_manager(self):
+        """Return the shared Zendure MQTT manager."""
+        return self._entry.runtime_data.mqtt_manager
+
+    @property
+    def native_value(self) -> float | None:
+        """Return current PV power from direct MQTT feedback."""
+        value = self.mqtt_manager.get_value(
+            self._device_id,
+            self._measurement,
+        )
+
+        try:
+            return round(float(value), 1)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return MQTT source information."""
+        return {
+            "mqtt_meting": self._measurement,
+            "solarflow_id": self._device_id,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to MQTT cache updates."""
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            self.mqtt_manager.async_add_listener(
+                self._async_mqtt_updated
+            )
+        )
+
+    @callback
+    def _async_mqtt_updated(self) -> None:
+        """Write MQTT feedback to Home Assistant."""
+        self.async_write_ha_state()
 
 
 class BaseSensor(HomeEnergyManagerEntity, SensorEntity):
@@ -648,6 +779,70 @@ class AvailableEnergySensor(_EnergyMixin, BaseSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         return {"reserve_percentage": self.RESERVE_PERCENTAGE}
+
+
+class PackStatusSensor(BaseSensor):
+    """Combined packState status for the physical SolarFlow devices."""
+
+    _attr_icon = "mdi:battery-sync"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "pack_status",
+            "Pack-status",
+        )
+
+    @property
+    def native_value(self) -> str | None:
+        """Return one shared state or 'mixed' when packs differ."""
+        states: list[str] = []
+
+        for device_id in sorted(self.mqtt_manager.get_device_ids()):
+            value = self.mqtt_manager.get_value(device_id, "packState")
+
+            if value is None:
+                continue
+
+            state = str(value).strip().lower()
+            if state:
+                states.append(state)
+
+        if not states:
+            return None
+
+        unique_states = set(states)
+
+        if len(unique_states) == 1:
+            return states[0]
+
+        return "mixed"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the individual pack states and counters."""
+        individual: dict[str, str] = {}
+        counts: dict[str, int] = {}
+
+        for device_id in sorted(self.mqtt_manager.get_device_ids()):
+            value = self.mqtt_manager.get_value(device_id, "packState")
+
+            if value is None:
+                individual[device_id] = "unavailable"
+                continue
+
+            state = str(value).strip().lower() or "unknown"
+            individual[device_id] = state
+            counts[state] = counts.get(state, 0) + 1
+
+        return {
+            "individuele_pack_status": individual,
+            "charging": counts.get("charging", 0),
+            "discharging": counts.get("discharging", 0),
+            "idle": counts.get("idle", 0),
+            "totaal_accus": self.mqtt_manager.get_device_count(),
+        }
 
 
 class NetBatteryPowerSensor(BaseSensor):
