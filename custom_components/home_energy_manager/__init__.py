@@ -18,7 +18,10 @@ _LOGGER = logging.getLogger(__name__)
 
 MqttValue: TypeAlias = float | str | None
 
-ZENDURE_BASE_TOPIC = "Zendure/sensor"
+ZENDURE_SENSOR_TOPIC = "Zendure/sensor"
+ZENDURE_NUMBER_TOPIC = "Zendure/number"
+ZENDURE_SWITCH_TOPIC = "Zendure/switch"
+ZENDURE_SELECT_TOPIC = "Zendure/select"
 
 ZENDURE_MEASUREMENTS = {
     # Main SolarFlow measurements
@@ -55,6 +58,25 @@ TEXT_MEASUREMENTS = {
     "softVersion",
 }
 
+ZENDURE_NUMBER_SETTINGS = {
+    "socSet",
+    "minSoc",
+    "inverseMaxPower",
+    "outputLimit",
+    "inputLimit",
+}
+
+ZENDURE_SWITCH_SETTINGS = {
+    "lampSwitch",
+    "smartMode",
+}
+
+ZENDURE_SELECT_SETTINGS = {
+    "acMode",
+    "gridReverse",
+    "gridOffMode",
+}
+
 
 class ZendureMqttManager:
     """Manage direct Zendure MQTT subscriptions and values."""
@@ -74,26 +96,34 @@ class ZendureMqttManager:
         #     }
         # }
         self.values: dict[str, dict[str, MqttValue]] = {}
+        self.number_values: dict[str, dict[str, MqttValue]] = {}
+        self.switch_values: dict[str, dict[str, MqttValue]] = {}
+        self.select_values: dict[str, dict[str, MqttValue]] = {}
 
         self._unsubscribers: list[Callable[[], None]] = []
         self._listeners: set[Callable[[], None]] = set()
 
     async def async_start(self) -> None:
         """Start listening to Zendure MQTT topics."""
-        topic = f"{ZENDURE_BASE_TOPIC}/+/+"
-
-        unsubscribe = await mqtt.async_subscribe(
-            self.hass,
-            topic,
-            self._async_message_received,
-            qos=0,
+        topics = (
+            f"{ZENDURE_SENSOR_TOPIC}/+/+",
+            f"{ZENDURE_NUMBER_TOPIC}/+/+",
+            f"{ZENDURE_SWITCH_TOPIC}/+/+",
+            f"{ZENDURE_SELECT_TOPIC}/+/+",
         )
 
-        self._unsubscribers.append(unsubscribe)
+        for topic in topics:
+            unsubscribe = await mqtt.async_subscribe(
+                self.hass,
+                topic,
+                self._async_message_received,
+                qos=0,
+            )
+            self._unsubscribers.append(unsubscribe)
 
         _LOGGER.info(
             "Zendure MQTT manager gestart en luistert naar %s",
-            topic,
+            ", ".join(topics),
         )
 
     async def _async_message_received(
@@ -103,48 +133,60 @@ class ZendureMqttManager:
         """Process an incoming Zendure MQTT message."""
         topic_parts = msg.topic.split("/")
 
-        # Verwachte structuur:
-        # Zendure/sensor/<device_id>/<measurement>
-        if len(topic_parts) != 4:
+        if len(topic_parts) != 4 or topic_parts[0] != "Zendure":
             return
 
-        if topic_parts[0] != "Zendure" or topic_parts[1] != "sensor":
-            return
-
+        category = topic_parts[1]
         device_id = topic_parts[2]
-        measurement = topic_parts[3]
+        key = topic_parts[3]
 
-        # Negeer onderwerpen die Home Energy Manager nog niet gebruikt.
-        if measurement not in ZENDURE_MEASUREMENTS:
+        if category == "sensor":
+            if key not in ZENDURE_MEASUREMENTS:
+                return
+            value = self._parse_sensor_value(key, msg.payload)
+            target = self.values
+
+        elif category == "number":
+            if key not in ZENDURE_NUMBER_SETTINGS:
+                return
+            value = self._parse_number_value(msg.payload)
+            target = self.number_values
+
+        elif category == "switch":
+            if key not in ZENDURE_SWITCH_SETTINGS:
+                return
+            value = self._parse_text_value(msg.payload)
+            target = self.switch_values
+
+        elif category == "select":
+            if key not in ZENDURE_SELECT_SETTINGS:
+                return
+            value = self._parse_text_value(msg.payload)
+            target = self.select_values
+
+        else:
             return
 
-        value = self._parse_value(
-            measurement,
-            msg.payload,
-        )
-
-        device_values = self.values.setdefault(
-            device_id,
-            {},
-        )
-        device_values[measurement] = value
+        device_values = target.setdefault(device_id, {})
+        device_values[key] = value
 
         for listener in list(self._listeners):
             listener()
 
         _LOGGER.debug(
-            "Zendure MQTT ontvangen: apparaat=%s, meting=%s, waarde=%s",
+            "Zendure MQTT ontvangen: categorie=%s, apparaat=%s, key=%s, waarde=%s",
+            category,
             device_id,
-            measurement,
+            key,
             value,
         )
 
     @staticmethod
-    def _parse_value(
+    def _parse_sensor_value(
         measurement: str,
         payload: str,
     ) -> MqttValue:
-        """Convert an MQTT payload to the appropriate value."""
+        """Convert a sensor MQTT payload to the appropriate value."""
         if measurement in TEXT_MEASUREMENTS:
             return str(payload).strip()
 
@@ -152,6 +194,19 @@ class ZendureMqttManager:
             return float(payload)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _parse_number_value(payload: str) -> MqttValue:
+        """Convert a number MQTT payload."""
+        try:
+            return float(payload)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _parse_text_value(payload: str) -> str:
+        """Convert a text MQTT payload."""
+        return str(payload).strip()
 
     def async_add_listener(
         self,
@@ -172,6 +227,41 @@ class ZendureMqttManager:
     ) -> MqttValue:
         """Return a cached MQTT value."""
         return self.values.get(device_id, {}).get(measurement)
+
+    def get_number_value(
+        self,
+        device_id: str,
+        setting: str,
+    ) -> MqttValue:
+        """Return a cached Zendure number setting."""
+        return self.number_values.get(device_id, {}).get(setting)
+
+    def get_switch_value(
+        self,
+        device_id: str,
+        setting: str,
+    ) -> MqttValue:
+        """Return a cached Zendure switch setting."""
+        return self.switch_values.get(device_id, {}).get(setting)
+
+    def get_select_value(
+        self,
+        device_id: str,
+        setting: str,
+    ) -> MqttValue:
+        """Return a cached Zendure select setting."""
+        return self.select_values.get(device_id, {}).get(setting)
+
+    def get_control_snapshot(
+        self,
+        device_id: str,
+    ) -> dict[str, dict[str, MqttValue]]:
+        """Return all cached control values for a device."""
+        return {
+            "number": dict(self.number_values.get(device_id, {})),
+            "switch": dict(self.switch_values.get(device_id, {})),
+            "select": dict(self.select_values.get(device_id, {})),
+        }
 
     def get_numeric_values(self, measurement: str) -> list[float]:
         """Return all valid numeric values for a measurement."""

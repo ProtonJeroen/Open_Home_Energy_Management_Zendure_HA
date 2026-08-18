@@ -44,6 +44,7 @@ async def async_setup_entry(
         TotalChargedEnergySensor(entry, source_entities),
         TotalDischargedEnergySensor(entry, source_entities),
         VirtualPowerSensor(entry, source_entities),
+        MqttControlsDiagnosticSensor(entry, source_entities),
         AggregateMeasurementSensor(
             entry,
             source_entities,
@@ -540,7 +541,7 @@ class CumulativeEnergySensor(
 
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_state_class = SensorStateClass.TOTAL
     _attr_suggested_display_precision = 3
 
     # Do not bridge long MQTT/restart gaps into artificial energy.
@@ -620,10 +621,17 @@ class CumulativeEnergySensor(
                     / 3_600_000.0
                 )
 
-                self._attr_native_value = round(
-                    float(self._attr_native_value or 0.0)
-                    + added_kwh,
+                current_total = float(
+                    self._attr_native_value or 0.0
+                )
+                new_total = round(
+                    current_total + added_kwh,
                     6,
+                )
+
+                self._attr_native_value = max(
+                    current_total,
+                    new_total,
                 )
 
         self._last_sample_time = now
@@ -698,6 +706,62 @@ class VirtualPowerSensor(BaseSensor):
         return {
             "bron": "directe MQTT-cache",
             "tekenrichting": "positief = laden, negatief = ontladen",
+        }
+
+
+class MqttControlsDiagnosticSensor(BaseSensor):
+    """Diagnostic view of cached Zendure control values."""
+
+    _attr_icon = "mdi:tune-variant"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "mqtt_controls_diagnostic",
+            "Zendure MQTT controls ontvangen",
+        )
+
+    @property
+    def native_value(self) -> int:
+        """Return the number of SolarFlow devices with control data."""
+        device_ids = set(self.mqtt_manager.get_device_ids())
+        device_ids.update(self.mqtt_manager.number_values)
+        device_ids.update(self.mqtt_manager.switch_values)
+        device_ids.update(self.mqtt_manager.select_values)
+
+        return sum(
+            1
+            for device_id in device_ids
+            if any(
+                self.mqtt_manager.get_control_snapshot(device_id).values()
+            )
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return all currently cached control values."""
+        device_ids = set(self.mqtt_manager.get_device_ids())
+        device_ids.update(self.mqtt_manager.number_values)
+        device_ids.update(self.mqtt_manager.switch_values)
+        device_ids.update(self.mqtt_manager.select_values)
+
+        devices: dict[str, dict[str, dict[str, Any]]] = {}
+
+        for device_id in sorted(device_ids):
+            snapshot = self.mqtt_manager.get_control_snapshot(device_id)
+
+            if any(snapshot.values()):
+                devices[device_id] = snapshot
+
+        return {
+            "devices": devices,
+            "aantal_apparaten_met_controls": len(devices),
+            "verwachte_categorieen": [
+                "number",
+                "switch",
+                "select",
+            ],
         }
 
 
