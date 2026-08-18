@@ -3,7 +3,7 @@
 from typing import Final
 
 DOMAIN: Final = "home_energy_manager"
-PLATFORMS: Final = ["sensor", "binary_sensor"]
+PLATFORMS: Final = ["sensor", "binary_sensor", "select"]
 
 CONF_SOC_ENTITIES: Final = "soc_entities"
 CONF_POWER_ENTITIES: Final = "power_entities"
@@ -14,5 +14,3 @@ CONF_PACK_OUTPUT_ENTITIES = "pack_output_entities"
 
 DEFAULT_CAPACITY_PER_DEVICE: Final = 2400.0
 DEFAULT_BALANCE_THRESHOLD: Final = 3.0
-
-ZENDURE_CONTROL_CATEGORIES: Final = ("number", "switch", "select")

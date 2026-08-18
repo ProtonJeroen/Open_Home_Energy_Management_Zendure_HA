@@ -252,6 +252,38 @@ class ZendureMqttManager:
         """Return a cached Zendure select setting."""
         return self.select_values.get(device_id, {}).get(setting)
 
+    async def async_set_select_value(
+        self,
+        device_id: str,
+        setting: str,
+        value: str,
+    ) -> None:
+        """Publish a Zendure select command."""
+        if setting not in ZENDURE_SELECT_SETTINGS:
+            raise ValueError(
+                f"Unsupported Zendure select setting: {setting}"
+            )
+
+        topic = (
+            f"{ZENDURE_SELECT_TOPIC}/"
+            f"{device_id}/{setting}/set"
+        )
+
+        await mqtt.async_publish(
+            self.hass,
+            topic,
+            value,
+            qos=0,
+            retain=False,
+        )
+
+        _LOGGER.info(
+            "Zendure MQTT opdracht verzonden: apparaat=%s, setting=%s, waarde=%s",
+            device_id,
+            setting,
+            value,
+        )
+
     def get_control_snapshot(
         self,
         device_id: str,
