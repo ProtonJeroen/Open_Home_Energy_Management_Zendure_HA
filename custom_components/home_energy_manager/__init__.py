@@ -236,6 +236,41 @@ class ZendureMqttManager:
         """Return a cached Zendure number setting."""
         return self.number_values.get(device_id, {}).get(setting)
 
+    async def async_set_number_value(
+        self,
+        device_id: str,
+        setting: str,
+        value: float,
+    ) -> None:
+        """Publish a Zendure number command."""
+        if setting not in ZENDURE_NUMBER_SETTINGS:
+            raise ValueError(
+                f"Unsupported Zendure number setting: {setting}"
+            )
+
+        topic = (
+            f"{ZENDURE_NUMBER_TOPIC}/"
+            f"{device_id}/{setting}/set"
+        )
+
+        payload = str(int(value)) if float(value).is_integer() else str(value)
+
+        await mqtt.async_publish(
+            self.hass,
+            topic,
+            payload,
+            qos=0,
+            retain=False,
+        )
+
+        _LOGGER.info(
+            "Zendure MQTT number opdracht verzonden: "
+            "apparaat=%s, setting=%s, waarde=%s",
+            device_id,
+            setting,
+            payload,
+        )
+
     def get_switch_value(
         self,
         device_id: str,

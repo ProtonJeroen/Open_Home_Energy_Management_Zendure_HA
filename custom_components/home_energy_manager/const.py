@@ -3,7 +3,7 @@
 from typing import Final
 
 DOMAIN: Final = "home_energy_manager"
-PLATFORMS: Final = ["sensor", "binary_sensor", "select"]
+PLATFORMS: Final = ["sensor", "binary_sensor", "select", "number"]
 
 CONF_SOC_ENTITIES: Final = "soc_entities"
 CONF_POWER_ENTITIES: Final = "power_entities"
