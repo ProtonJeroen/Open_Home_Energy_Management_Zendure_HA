@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfEnergy, UnitOfPower, UnitOfTemperature
+from homeassistant.const import PERCENTAGE, UnitOfElectricPotential, UnitOfEnergy, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -95,6 +95,9 @@ async def async_setup_entry(
             icon="mdi:battery-heart-variant",
         ),
         MaxBatteryTemperatureSensor(entry, source_entities),
+        HighestCellVoltageSensor(entry, source_entities),
+        LowestCellVoltageSensor(entry, source_entities),
+        CellVoltageSpreadSensor(entry, source_entities),
         RemainingOutputTimeSensor(entry, source_entities),
     ]
 
@@ -281,6 +284,140 @@ class MaxBatteryTemperatureSensor(BaseSensor):
             "beschikbare_waarden": self.mqtt_manager.count_measurement(
                 "maxTemp"
             ),
+        }
+
+
+class HighestCellVoltageSensor(BaseSensor):
+    _attr_suggested_display_precision = 2
+    """Highest cell voltage across all battery packs."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-arrow-up"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "highest_cell_voltage",
+            "Hoogste celspanning",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.mqtt_manager.max_measurement("maxVol")
+        return round(value, 3) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        values: dict[str, float] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            raw = self.mqtt_manager.get_value(source_id, "maxVol")
+            try:
+                values[source_id] = round(float(raw), 3)
+            except (TypeError, ValueError):
+                continue
+
+        return {
+            "mqtt_meting": "maxVol",
+            "bronwaarden": values,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement("maxVol"),
+        }
+
+
+class LowestCellVoltageSensor(BaseSensor):
+    _attr_suggested_display_precision = 2
+    """Lowest cell voltage across all battery packs."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-arrow-down"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "lowest_cell_voltage",
+            "Laagste celspanning",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        value = self.mqtt_manager.min_measurement("minVol")
+        return round(value, 3) if value is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        values: dict[str, float] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            raw = self.mqtt_manager.get_value(source_id, "minVol")
+            try:
+                values[source_id] = round(float(raw), 3)
+            except (TypeError, ValueError):
+                continue
+
+        return {
+            "mqtt_meting": "minVol",
+            "bronwaarden": values,
+            "beschikbare_waarden": self.mqtt_manager.count_measurement("minVol"),
+        }
+
+
+class CellVoltageSpreadSensor(BaseSensor):
+    _attr_suggested_display_precision = 2
+    """Largest per-pack cell-voltage spread."""
+
+    _attr_native_unit_of_measurement = UnitOfElectricPotential.VOLT
+    _attr_device_class = SensorDeviceClass.VOLTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:chart-bell-curve-cumulative"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "cell_voltage_spread",
+            "Celspanningsverschil",
+        )
+
+    def _pack_spreads(self) -> dict[str, float]:
+        spreads: dict[str, float] = {}
+
+        for source_id in sorted(self.mqtt_manager.get_all_source_ids()):
+            min_raw = self.mqtt_manager.get_value(source_id, "minVol")
+            max_raw = self.mqtt_manager.get_value(source_id, "maxVol")
+
+            try:
+                min_value = float(min_raw)
+                max_value = float(max_raw)
+            except (TypeError, ValueError):
+                continue
+
+            spreads[source_id] = max(0.0, max_value - min_value)
+
+        return spreads
+
+    @property
+    def native_value(self) -> float | None:
+        spreads = self._pack_spreads()
+        if not spreads:
+            return None
+        return round(max(spreads.values()), 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        spreads = self._pack_spreads()
+        return {
+            "berekening": "maxVol - minVol per batterijpack",
+            "bronwaarden": {
+                source_id: round(value, 3)
+                for source_id, value in spreads.items()
+            },
+            "beschikbare_packs": len(spreads),
         }
 
 
