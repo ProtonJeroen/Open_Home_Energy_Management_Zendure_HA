@@ -11,6 +11,12 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
 from .const import (
+    CONF_CONTROL_GAIN_PERCENT,
+    DEFAULT_CONTROL_GAIN_PERCENT,
+    CONF_MAX_POWER_PER_BATTERY_W,
+    DEFAULT_MAX_POWER_PER_BATTERY_W,
+    CONF_AUTOMATIC_BATTERY_CONTROL,
+    DEFAULT_AUTOMATIC_BATTERY_CONTROL,
     CONF_BALANCE_THRESHOLD,
     CONF_GRID_POWER_ENTITY,
     CONF_GRID_DEAD_BAND_W,
@@ -192,6 +198,57 @@ class HomeEnergyManagerOptionsFlow(config_entries.OptionsFlow):
                 max=500,
                 step=10,
                 unit_of_measurement="W",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        )
+
+        current_auto_control = self.config_entry.options.get(
+            CONF_AUTOMATIC_BATTERY_CONTROL,
+            DEFAULT_AUTOMATIC_BATTERY_CONTROL,
+        )
+        schema_dict[
+            vol.Optional(
+                CONF_AUTOMATIC_BATTERY_CONTROL,
+                default=current_auto_control,
+            )
+        ] = selector.BooleanSelector()
+
+        current_max_power_per_battery = self.config_entry.options.get(
+            CONF_MAX_POWER_PER_BATTERY_W,
+            DEFAULT_MAX_POWER_PER_BATTERY_W,
+        )
+
+        schema_dict[
+            vol.Optional(
+                CONF_MAX_POWER_PER_BATTERY_W,
+                default=current_max_power_per_battery,
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=100,
+                max=2400,
+                step=50,
+                unit_of_measurement="W",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        )
+
+        current_control_gain = self.config_entry.options.get(
+            CONF_CONTROL_GAIN_PERCENT,
+            DEFAULT_CONTROL_GAIN_PERCENT,
+        )
+
+        schema_dict[
+            vol.Optional(
+                CONF_CONTROL_GAIN_PERCENT,
+                default=current_control_gain,
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=10,
+                max=100,
+                step=5,
+                unit_of_measurement="%",
                 mode=selector.NumberSelectorMode.BOX,
             )
         )

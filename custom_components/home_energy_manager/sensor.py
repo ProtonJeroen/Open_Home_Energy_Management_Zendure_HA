@@ -24,10 +24,14 @@ from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import (
     CONF_CAPACITY_PER_DEVICE,
+    CONF_CONTROL_GAIN_PERCENT,
     CONF_GRID_DEAD_BAND_W,
     CONF_GRID_POWER_ENTITY,
     CONF_KNOWN_SOLARFLOW_IDS,
+    CONF_MAX_POWER_PER_BATTERY_W,
     DEFAULT_GRID_DEAD_BAND_W,
+    DEFAULT_CONTROL_GAIN_PERCENT,
+    DEFAULT_MAX_POWER_PER_BATTERY_W,
     DOMAIN,
 )
 from .entity import HomeEnergyManagerEntity
@@ -76,7 +80,6 @@ async def async_setup_entry(
         GridPowerSensor(entry, source_entities),
         DesiredBatteryPowerSensor(entry, source_entities),
         RegulatedBatteryPowerSensor(entry, source_entities),
-        ControllerDiagnosticsSensor(entry, source_entities),
         SolarFlowTargetPowerSensor(entry, source_entities, "040363"),
         SolarFlowTargetPowerSensor(entry, source_entities, "040453"),
         SolarFlowTargetPowerSensor(entry, source_entities, "040458"),
@@ -872,8 +875,8 @@ class DesiredBatteryPowerSensor(BaseSensor):
 class _GridControllerMixin:
     """Shared preview controller calculations."""
 
-    FILTER_ALPHA = 0.45
-    MAX_STEP_W = 500.0
+    FILTER_ALPHA = 0.75
+    MAX_STEP_W = 800.0
 
     @property
     def grid_power_entity(self) -> str | None:
@@ -933,6 +936,15 @@ class _GridControllerMixin:
         if raw is None:
             return current
 
+        control_gain = float(
+            self._entry.options.get(
+                CONF_CONTROL_GAIN_PERCENT,
+                DEFAULT_CONTROL_GAIN_PERCENT,
+            )
+        ) / 100.0
+
+        raw *= control_gain
+
         maximum = self._maximum_total_power_w()
         raw = max(-maximum, min(maximum, raw))
 
@@ -951,7 +963,7 @@ class _GridControllerMixin:
 
 
 class RegulatedBatteryPowerSensor(_GridControllerMixin, BaseSensor):
-    """Preview of the stabilized total battery power target."""
+    """Closed-loop battery target using actual battery power and P1 feedback."""
 
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_device_class = SensorDeviceClass.POWER
@@ -966,83 +978,12 @@ class RegulatedBatteryPowerSensor(_GridControllerMixin, BaseSensor):
             "regulated_battery_power",
             "Geregeld batterijvermogen",
         )
-        self._regulated_w: float | None = None
+        self._regulated_w: float | None = 0.0
 
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        self._regulated_w = self._next_regulated(self._regulated_w)
-        entity_id = self.grid_power_entity
-        if entity_id:
-            self.async_on_remove(
-                async_track_state_change_event(
-                    self.hass,
-                    [entity_id],
-                    self._async_grid_power_changed,
-                )
-            )
-
-    @callback
-    def _async_grid_power_changed(self, event) -> None:
-        self._regulated_w = self._next_regulated(self._regulated_w)
-        self.async_write_ha_state()
-
-    @property
-    def native_value(self) -> float | None:
-        return None if self._regulated_w is None else round(self._regulated_w, 1)
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return {
-            "dode_zone_w": self._dead_band_w(),
-            "filter_alpha": self.FILTER_ALPHA,
-            "max_stap_per_update_w": self.MAX_STEP_W,
-            "max_totaalvermogen_w": round(self._maximum_total_power_w(), 1),
-            "tekenrichting": "positief = laden, negatief = ontladen",
-            "modus": "preview - geen MQTT besturing",
-        }
-
-
-class SolarFlowTargetPowerSensor(_GridControllerMixin, SensorEntity):
-    """Preview target power for one physical SolarFlow."""
-
-    _attr_has_entity_name = True
-    _attr_native_unit_of_measurement = UnitOfPower.WATT
-    _attr_device_class = SensorDeviceClass.POWER
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_icon = "mdi:battery-sync"
-    _attr_suggested_display_precision = 0
-
-    def __init__(
-        self,
-        entry: ConfigEntry,
-        short_id: str,
-        identifiers: set[tuple[str, str]],
-    ) -> None:
-        self._entry = entry
-        self._short_id = short_id
-        self._regulated_total_w: float | None = None
-
-        self._attr_unique_id = (
-            f"{entry.entry_id}_solarflow_{short_id}_target_power"
-        )
-        self._attr_name = f"Doelvermogen {short_id}"
-
-        # Reuse the identifiers of the already existing physical SolarFlow
-        # device, so this entity attaches to that device even with MQTT off.
-        if identifiers:
-            self._attr_device_info = DeviceInfo(
-                identifiers=identifiers,
-                name=f"SolarFlow {short_id}",
-                manufacturer="Zendure",
-                model="SolarFlow 2400 Pro",
-                via_device=(DOMAIN, entry.entry_id),
-            )
-
-    @property
-    def _known_short_ids(self) -> set[str]:
-        """Return physical SolarFlow suffixes from existing control entities."""
+    def _known_solarflow_count(self) -> int:
+        """Count physical SolarFlows from existing HA control entities."""
         entity_registry = er.async_get(self.hass)
-        result: set[str] = set()
+        found: set[str] = set()
 
         for entity_entry in er.async_entries_for_config_entry(
             entity_registry,
@@ -1053,24 +994,77 @@ class SolarFlowTargetPowerSensor(_GridControllerMixin, SensorEntity):
                 entity_entry.entity_id,
             )
             if match is not None:
-                result.add(match.group(1))
+                found.add(match.group(1))
 
-        return result
+        return len(found)
 
-    def _live_mqtt_id(self) -> str | None:
-        """Return matching live Zendure MQTT device ID, if available."""
-        for device_id in (
-            self._entry.runtime_data.mqtt_manager.get_device_ids()
-        ):
-            if str(device_id).endswith(self._short_id):
-                return str(device_id)
-        return None
+    def _maximum_total_power_w(self) -> float:
+        """Return configured maximum power for the complete battery system."""
+        per_battery = float(
+            self._entry.options.get(
+                CONF_MAX_POWER_PER_BATTERY_W,
+                DEFAULT_MAX_POWER_PER_BATTERY_W,
+            )
+        )
+        return float(self._known_solarflow_count() * per_battery)
+
+    def _actual_battery_power_w(self) -> float:
+        """Return actual net battery power using the same sign as the target.
+
+        Positive = charging, negative = discharging.
+        """
+        charge = self.mqtt_manager.sum_measurement("outputPackPower")
+        discharge = self.mqtt_manager.sum_measurement("packInputPower")
+        return float(charge - discharge)
+
+    def _next_regulated(self) -> float | None:
+        grid_power = self._grid_power_w()
+        if grid_power is None:
+            return self._regulated_w
+
+        actual_battery = self._actual_battery_power_w()
+        dead_band = self._dead_band_w()
+
+        # Around zero, hold the actual battery power instead of accumulating
+        # another correction. This prevents hunting around the setpoint.
+        if abs(grid_power) <= dead_band:
+            target = actual_battery
+        else:
+            gain = float(
+                self._entry.options.get(
+                    CONF_CONTROL_GAIN_PERCENT,
+                    DEFAULT_CONTROL_GAIN_PERCENT,
+                )
+            ) / 100.0
+
+            # P1 measures the complete house connection.
+            #
+            # Example:
+            # actual battery = -700 W (discharging)
+            # P1 grid import = +400 W
+            # target at 100% = -700 - 400 = -1100 W
+            #
+            # This does not accumulate old targets, so repeated P1 updates
+            # cannot run the target away to the configured maximum.
+            target = actual_battery - (grid_power * gain)
+
+        maximum = self._maximum_total_power_w()
+        if maximum > 0:
+            target = max(-maximum, min(maximum, target))
+
+        # Limit a single command jump while preserving closed-loop feedback.
+        if self._regulated_w is not None:
+            delta = target - self._regulated_w
+            delta = max(
+                -self.MAX_STEP_W,
+                min(self.MAX_STEP_W, delta),
+            )
+            target = self._regulated_w + delta
+
+        return target
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        self._regulated_total_w = self._next_regulated(
-            self._regulated_total_w
-        )
 
         entity_id = self.grid_power_entity
         if entity_id:
@@ -1082,53 +1076,74 @@ class SolarFlowTargetPowerSensor(_GridControllerMixin, SensorEntity):
                 )
             )
 
+        # Also refresh when actual Zendure battery feedback changes.
+        self.async_on_remove(
+            self.mqtt_manager.async_add_listener(
+                self._async_mqtt_updated
+            )
+        )
+
     @callback
     def _async_grid_power_changed(self, event) -> None:
-        self._regulated_total_w = self._next_regulated(
-            self._regulated_total_w
-        )
+        self._regulated_w = self._next_regulated()
+        self.async_write_ha_state()
+
+    @callback
+    def _async_mqtt_updated(self) -> None:
+        self._regulated_w = self._next_regulated()
         self.async_write_ha_state()
 
     @property
     def native_value(self) -> float | None:
-        if self._regulated_total_w is None:
+        if self._regulated_w is None:
             return None
-
-        device_count = len(self._known_short_ids)
-        if device_count <= 0:
-            return None
-
-        return round(
-            self._regulated_total_w / device_count,
-            1,
-        )
+        return round(self._regulated_w, 1)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        live_mqtt_id = self._live_mqtt_id()
+        grid_power = self._grid_power_w()
+        actual_battery = self._actual_battery_power_w()
 
         return {
-            "solarflow": self._short_id,
-            "verdeling": "gelijk over alle SolarFlows",
-            "aantal_solarflows": len(self._known_short_ids),
-            "mqtt_besturing_beschikbaar": live_mqtt_id is not None,
-            "mqtt_status": (
-                "online" if live_mqtt_id is not None
-                else "niet beschikbaar"
+            "netvermogen_w": (
+                round(grid_power, 1)
+                if grid_power is not None
+                else None
             ),
-            "mqtt_device_id": live_mqtt_id,
-            "bron_apparaatlijst": "Home Assistant entity registry",
-            "tekenrichting": "positief = laden, negatief = ontladen",
-            "modus": "preview - geen MQTT besturing",
+            "werkelijk_batterijvermogen_w": round(
+                actual_battery,
+                1,
+            ),
+            "dode_zone_w": self._dead_band_w(),
+            "correctiefactor_percent": float(
+                self._entry.options.get(
+                    CONF_CONTROL_GAIN_PERCENT,
+                    DEFAULT_CONTROL_GAIN_PERCENT,
+                )
+            ),
+            "regelprincipe": (
+                "werkelijk batterijvermogen - P1 netafwijking"
+            ),
+            "max_stap_per_update_w": self.MAX_STEP_W,
+            "max_vermogen_per_batterij_w": float(
+                self._entry.options.get(
+                    CONF_MAX_POWER_PER_BATTERY_W,
+                    DEFAULT_MAX_POWER_PER_BATTERY_W,
+                )
+            ),
+            "max_totaalvermogen_w": round(
+                self._maximum_total_power_w(),
+                1,
+            ),
+            "tekenrichting": (
+                "positief = laden, negatief = ontladen"
+            ),
+            "modus": "5x P1 + echte batterijfeedback",
         }
 
 
 class SolarFlowTargetPowerSensor(BaseSensor):
-    """Preview target power for one SolarFlow.
-
-    Positive = charging, negative = discharging.
-    This sensor does not control the SolarFlow yet.
-    """
+    """Preview target power for one SolarFlow."""
 
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_device_class = SensorDeviceClass.POWER
@@ -1144,8 +1159,14 @@ class SolarFlowTargetPowerSensor(BaseSensor):
             f"Doelvermogen {short_id}",
         )
 
+    @property
+    def grid_power_entity(self) -> str | None:
+        return self._entry.options.get(
+            CONF_GRID_POWER_ENTITY,
+            self._entry.data.get(CONF_GRID_POWER_ENTITY),
+        )
+
     def _solarflow_ids(self) -> list[str]:
-        """Discover SolarFlows from their HA control entities."""
         entity_registry = er.async_get(self.hass)
         found: set[str] = set()
 
@@ -1162,25 +1183,39 @@ class SolarFlowTargetPowerSensor(BaseSensor):
 
         return sorted(found)
 
-    @property
-    def native_value(self) -> float | None:
-        grid_entity = self._entry.options.get(
-            CONF_GRID_POWER_ENTITY,
-            self._entry.data.get(CONF_GRID_POWER_ENTITY),
-        )
+    def _regulated_total_w(self) -> float | None:
+        """Read the regulated total directly from its entity if available."""
+        for state in self.hass.states.async_all("sensor"):
+            if (
+                state.attributes.get("friendly_name")
+                == "Battery System Geregeld batterijvermogen"
+                or state.attributes.get("friendly_name")
+                == "Geregeld batterijvermogen"
+            ):
+                try:
+                    return float(state.state)
+                except (TypeError, ValueError):
+                    pass
+
+        # Fallback to direct P1 calculation if entity lookup is not ready.
+        grid_entity = self.grid_power_entity
         if not grid_entity:
             return None
 
         grid_state = self.hass.states.get(grid_entity)
-        if grid_state is None:
+        if grid_state is None or grid_state.state in (
+            "unknown",
+            "unavailable",
+        ):
             return None
 
         try:
             grid_power_w = float(grid_state.state)
-            if grid_state.attributes.get("unit_of_measurement") == "kW":
-                grid_power_w *= 1000.0
         except (TypeError, ValueError):
             return None
+
+        if grid_state.attributes.get("unit_of_measurement") == "kW":
+            grid_power_w *= 1000.0
 
         dead_band = float(
             self._entry.options.get(
@@ -1190,15 +1225,48 @@ class SolarFlowTargetPowerSensor(BaseSensor):
         )
 
         if abs(grid_power_w) <= dead_band:
-            desired_power_w = 0.0
-        else:
-            desired_power_w = -grid_power_w
+            return 0.0
 
+        return -grid_power_w
+
+    @property
+    def native_value(self) -> float | None:
+        total = self._regulated_total_w()
         ids = self._solarflow_ids()
-        if self._short_id not in ids or not ids:
+
+        if total is None or self._short_id not in ids or not ids:
             return None
 
-        return round(desired_power_w / len(ids), 1)
+        per_battery = float(
+            self._entry.options.get(
+                CONF_MAX_POWER_PER_BATTERY_W,
+                DEFAULT_MAX_POWER_PER_BATTERY_W,
+            )
+        )
+
+        target = total / len(ids)
+        target = max(-per_battery, min(per_battery, target))
+
+        return round(target, 1)
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        entity_id = self.grid_power_entity
+        if not entity_id:
+            return
+
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                [entity_id],
+                self._async_grid_power_changed,
+            )
+        )
+
+    @callback
+    def _async_grid_power_changed(self, event) -> None:
+        self.async_write_ha_state()
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -1206,130 +1274,9 @@ class SolarFlowTargetPowerSensor(BaseSensor):
             "solarflow_id": self._short_id,
             "betekenis": "positief = laden, negatief = ontladen",
             "besturing_actief": False,
-            "stap": "5h preview",
-        }
-
-
-class ControllerDiagnosticsSensor(BaseSensor):
-    """Diagnostics for controller target discovery and preview calculation."""
-
-    _attr_icon = "mdi:bug-check"
-
-    def __init__(self, entry, source_entities) -> None:
-        super().__init__(
-            entry,
-            source_entities,
-            "controller_diagnostics",
-            "Regelaar diagnostiek",
-        )
-
-    def _matching_target_entities(self) -> dict[str, list[str]]:
-        """Return existing SolarFlow control entities grouped by short ID."""
-        entity_registry = er.async_get(self.hass)
-        result: dict[str, list[str]] = {}
-
-        for entity_entry in er.async_entries_for_config_entry(
-            entity_registry,
-            self._entry.entry_id,
-        ):
-            match = re.match(
-                r"^(?:number|select)\.solarflow_(\d{6})_",
-                entity_entry.entity_id,
-            )
-            if match is None:
-                continue
-
-            short_id = match.group(1)
-            result.setdefault(short_id, []).append(
-                entity_entry.entity_id
-            )
-
-        return {
-            short_id: sorted(entities)
-            for short_id, entities in sorted(result.items())
-        }
-
-    @property
-    def native_value(self) -> int:
-        """Return number of discovered physical SolarFlows."""
-        return len(self._matching_target_entities())
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return detailed controller discovery information."""
-        targets = self._matching_target_entities()
-
-        live_mqtt_ids = sorted(
-            str(device_id)
-            for device_id in (
-                self._entry.runtime_data.mqtt_manager.get_device_ids()
-            )
-        )
-
-        grid_entity = self._entry.options.get(
-            CONF_GRID_POWER_ENTITY,
-            self._entry.data.get(CONF_GRID_POWER_ENTITY),
-        )
-
-        grid_state = (
-            self.hass.states.get(grid_entity)
-            if grid_entity
-            else None
-        )
-
-        grid_power_w = None
-        if grid_state is not None:
-            try:
-                grid_power_w = float(grid_state.state)
-                if (
-                    grid_state.attributes.get("unit_of_measurement")
-                    == "kW"
-                ):
-                    grid_power_w *= 1000.0
-            except (TypeError, ValueError):
-                grid_power_w = None
-
-        dead_band = float(
-            self._entry.options.get(
-                CONF_GRID_DEAD_BAND_W,
-                DEFAULT_GRID_DEAD_BAND_W,
-            )
-        )
-
-        if grid_power_w is None:
-            desired_power_w = None
-        elif abs(grid_power_w) <= dead_band:
-            desired_power_w = 0.0
-        else:
-            desired_power_w = -grid_power_w
-
-        return {
-            "gevonden_solarflows": sorted(targets.keys()),
-            "aantal_gevonden_solarflows": len(targets),
-            "control_entities_per_solarflow": targets,
-            "live_mqtt_device_ids": live_mqtt_ids,
-            "mqtt_beschikbaar": bool(live_mqtt_ids),
-            "netvermogen_entity": grid_entity,
-            "netvermogen_w": (
-                round(grid_power_w, 1)
-                if grid_power_w is not None
-                else None
-            ),
-            "dode_zone_w": dead_band,
-            "gewenst_batterijvermogen_w": (
-                round(desired_power_w, 1)
-                if desired_power_w is not None
-                else None
-            ),
-            "verwachte_verdeling_w": (
-                round(
-                    desired_power_w / len(targets),
-                    1,
-                )
-                if desired_power_w is not None and targets
-                else None
-            ),
-            "modus": "diagnostiek - geen MQTT besturing",
+            "update": "directe P1 state-change listener",
+            "bron": "Geregeld batterijvermogen",
+            "stap": "5s preview",
         }
 
 

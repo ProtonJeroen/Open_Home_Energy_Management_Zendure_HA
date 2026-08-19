@@ -12,7 +12,14 @@ from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_GRID_POWER_ENTITY, PLATFORMS
+from .const import (
+    CONF_AUTOMATIC_BATTERY_CONTROL,
+    CONF_GRID_POWER_ENTITY,
+    CONF_MAX_POWER_PER_BATTERY_W,
+    DEFAULT_AUTOMATIC_BATTERY_CONTROL,
+    DEFAULT_MAX_POWER_PER_BATTERY_W,
+    PLATFORMS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -444,9 +451,109 @@ class HomeEnergyManagerRuntimeData:
 
     source_entities: set[str]
     mqtt_manager: ZendureMqttManager
+    battery_controller: object | None = None
 
 
 HomeEnergyManagerConfigEntry = ConfigEntry[HomeEnergyManagerRuntimeData]
+
+
+class BatteryControlManager:
+    """Translate preview target power to Zendure input/output limits."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: HomeEnergyManagerConfigEntry,
+        mqtt_manager: ZendureMqttManager,
+    ) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.mqtt_manager = mqtt_manager
+        self._unsub: Callable[[], None] | None = None
+        self._last_commands: dict[str, tuple[int, int]] = {}
+
+    async def async_start(self) -> None:
+        """Listen to target sensor state changes."""
+        from homeassistant.helpers.event import async_track_state_change_event
+
+        entity_ids = [
+            "sensor.doelvermogen_040363",
+            "sensor.doelvermogen_040453",
+            "sensor.doelvermogen_040458",
+        ]
+        self._unsub = async_track_state_change_event(
+            self.hass,
+            entity_ids,
+            self._async_target_changed,
+        )
+
+    async def async_stop(self) -> None:
+        if self._unsub:
+            self._unsub()
+            self._unsub = None
+
+    async def _async_target_changed(self, event) -> None:
+        """Apply one changed target when automatic control is enabled."""
+        if not self.entry.options.get(
+            CONF_AUTOMATIC_BATTERY_CONTROL,
+            DEFAULT_AUTOMATIC_BATTERY_CONTROL,
+        ):
+            return
+
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+
+        try:
+            target = float(new_state.state)
+        except (TypeError, ValueError):
+            return
+
+        short_id = new_state.entity_id.rsplit("_", 1)[-1]
+        full_id = next(
+            (
+                str(device_id)
+                for device_id in self.mqtt_manager.get_device_ids()
+                if str(device_id).endswith(short_id)
+            ),
+            None,
+        )
+        if full_id is None:
+            _LOGGER.debug(
+                "Geen live MQTT device voor SolarFlow %s; opdracht overgeslagen",
+                short_id,
+            )
+            return
+
+        # Positive target = charge, negative target = discharge.
+        max_power = float(
+            self.entry.options.get(
+                CONF_MAX_POWER_PER_BATTERY_W,
+                DEFAULT_MAX_POWER_PER_BATTERY_W,
+            )
+        )
+
+        target = max(-max_power, min(max_power, target))
+
+        input_limit = max(0, int(round(target)))
+        output_limit = max(0, int(round(-target)))
+
+        # Never leave charge and discharge limits active together.
+        command = (input_limit, output_limit)
+        if self._last_commands.get(full_id) == command:
+            return
+
+        await self.mqtt_manager.async_set_number_value(
+            full_id,
+            "inputLimit",
+            input_limit,
+        )
+        await self.mqtt_manager.async_set_number_value(
+            full_id,
+            "outputLimit",
+            output_limit,
+        )
+        self._last_commands[full_id] = command
 
 
 
@@ -488,10 +595,19 @@ async def async_setup_entry(
 
     await mqtt_manager.async_start()
 
+    battery_controller = BatteryControlManager(
+        hass,
+        entry,
+        mqtt_manager,
+    )
+    entry.runtime_data.battery_controller = battery_controller
+
     await hass.config_entries.async_forward_entry_setups(
         entry,
         PLATFORMS,
     )
+
+    await battery_controller.async_start()
 
     return True
 
@@ -507,6 +623,9 @@ async def async_unload_entry(
     )
 
     if unload_ok:
+        controller = entry.runtime_data.battery_controller
+        if controller is not None:
+            await controller.async_stop()
         await entry.runtime_data.mqtt_manager.async_stop()
 
     return unload_ok

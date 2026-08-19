@@ -21,3 +21,12 @@ CONF_GRID_DEAD_BAND_W: Final = "grid_dead_band_w"
 DEFAULT_GRID_DEAD_BAND_W: Final = 50.0
 
 CONF_KNOWN_SOLARFLOW_IDS: Final = "known_solarflow_ids"
+
+CONF_AUTOMATIC_BATTERY_CONTROL: Final = "automatic_battery_control"
+DEFAULT_AUTOMATIC_BATTERY_CONTROL: Final = False
+
+CONF_MAX_POWER_PER_BATTERY_W: Final = "max_power_per_battery_w"
+DEFAULT_MAX_POWER_PER_BATTERY_W: Final = 800.0
+
+CONF_CONTROL_GAIN_PERCENT: Final = "control_gain_percent"
+DEFAULT_CONTROL_GAIN_PERCENT: Final = 100.0
