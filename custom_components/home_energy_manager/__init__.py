@@ -12,7 +12,7 @@ from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import PLATFORMS
+from .const import CONF_GRID_POWER_ENTITY, PLATFORMS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -449,6 +449,15 @@ class HomeEnergyManagerRuntimeData:
 HomeEnergyManagerConfigEntry = ConfigEntry[HomeEnergyManagerRuntimeData]
 
 
+
+async def async_update_options(
+    hass: HomeAssistant,
+    entry: HomeEnergyManagerConfigEntry,
+) -> None:
+    """Reload Home Energy Manager after options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: HomeEnergyManagerConfigEntry,
@@ -457,11 +466,24 @@ async def async_setup_entry(
     soc_entities = set(entry.data["soc_entities"])
     power_entities = set(entry.data.get("power_entities", []))
 
+    grid_power_entity = entry.options.get(
+        CONF_GRID_POWER_ENTITY,
+        entry.data.get(CONF_GRID_POWER_ENTITY),
+    )
+
+    source_entities = soc_entities | power_entities
+    if grid_power_entity:
+        source_entities.add(grid_power_entity)
+
     mqtt_manager = ZendureMqttManager(hass)
 
     entry.runtime_data = HomeEnergyManagerRuntimeData(
-        source_entities=soc_entities | power_entities,
+        source_entities=source_entities,
         mqtt_manager=mqtt_manager,
+    )
+
+    entry.async_on_unload(
+        entry.add_update_listener(async_update_options)
     )
 
     await mqtt_manager.async_start()

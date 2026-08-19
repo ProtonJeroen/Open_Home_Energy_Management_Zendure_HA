@@ -14,3 +14,5 @@ CONF_PACK_OUTPUT_ENTITIES = "pack_output_entities"
 
 DEFAULT_CAPACITY_PER_DEVICE: Final = 2400.0
 DEFAULT_BALANCE_THRESHOLD: Final = 3.0
+
+CONF_GRID_POWER_ENTITY: Final = "grid_power_entity"

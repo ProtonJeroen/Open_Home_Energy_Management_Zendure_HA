@@ -17,8 +17,9 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import CONF_CAPACITY_PER_DEVICE, DOMAIN
+from .const import CONF_CAPACITY_PER_DEVICE, CONF_GRID_POWER_ENTITY, DOMAIN
 from .entity import HomeEnergyManagerEntity
 
 
@@ -31,6 +32,7 @@ async def async_setup_entry(
     source_entities: set[str] = set()
 
     entities: list[SensorEntity] = [
+        GridPowerSensor(entry, source_entities),
         VirtualSocSensor(entry, source_entities),
         VirtualCapacitySensor(entry, source_entities),
         CurrentEnergySensor(entry, source_entities),
@@ -604,6 +606,87 @@ class RemainingOutputTimeSensor(BaseSensor):
             "beschikbare_waarden": self.mqtt_manager.count_measurement(
                 "remainOutTime"
             ),
+        }
+
+
+
+class GridPowerSensor(BaseSensor):
+    """Generic grid power input selected in integration options."""
+
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:transmission-tower"
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "grid_power",
+            "Netvermogen",
+        )
+
+    @property
+    def grid_power_entity(self) -> str | None:
+        """Return the configured grid power source entity."""
+        return self._entry.options.get(
+            CONF_GRID_POWER_ENTITY,
+            self._entry.data.get(CONF_GRID_POWER_ENTITY),
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        """Return grid power in W: positive import, negative export."""
+        entity_id = self.grid_power_entity
+
+        if not entity_id:
+            return None
+
+        state = self.hass.states.get(entity_id)
+
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+
+        unit = state.attributes.get("unit_of_measurement")
+
+        if unit == "kW":
+            value *= 1000.0
+
+        return round(value, 1)
+
+    async def async_added_to_hass(self) -> None:
+        """Listen directly to the configured P1/grid-power entity."""
+        await super().async_added_to_hass()
+
+        entity_id = self.grid_power_entity
+        if not entity_id:
+            return
+
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                [entity_id],
+                self._async_grid_power_changed,
+            )
+        )
+
+    @callback
+    def _async_grid_power_changed(self, event) -> None:
+        """Immediately mirror every source-entity state change."""
+        self.async_write_ha_state()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "bron_entity": self.grid_power_entity,
+            "tekenrichting": "positief = netafname, negatief = teruglevering",
+            "update": "directe state-change listener",
         }
 
 
