@@ -33,6 +33,7 @@ async def async_setup_entry(
 
     entities: list[SensorEntity] = [
         GridPowerSensor(entry, source_entities),
+        DesiredBatteryPowerSensor(entry, source_entities),
         VirtualSocSensor(entry, source_entities),
         VirtualCapacitySensor(entry, source_entities),
         CurrentEnergySensor(entry, source_entities),
@@ -687,6 +688,91 @@ class GridPowerSensor(BaseSensor):
             "bron_entity": self.grid_power_entity,
             "tekenrichting": "positief = netafname, negatief = teruglevering",
             "update": "directe state-change listener",
+        }
+
+
+class DesiredBatteryPowerSensor(BaseSensor):
+    """Desired battery power required to move grid power toward zero."""
+
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:target"
+    _attr_suggested_display_precision = 0
+
+    DEAD_BAND_W = 50.0
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "desired_battery_power",
+            "Gewenst batterijvermogen",
+        )
+
+    @property
+    def grid_power_entity(self) -> str | None:
+        """Return the configured grid power source entity."""
+        return self._entry.options.get(
+            CONF_GRID_POWER_ENTITY,
+            self._entry.data.get(CONF_GRID_POWER_ENTITY),
+        )
+
+    def _grid_power_w(self) -> float | None:
+        """Return grid power in W: positive import, negative export."""
+        entity_id = self.grid_power_entity
+
+        if not entity_id:
+            return None
+
+        state = self.hass.states.get(entity_id)
+
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+
+        if state.attributes.get("unit_of_measurement") == "kW":
+            value *= 1000.0
+
+        return value
+
+    @property
+    def native_value(self) -> float | None:
+        """Return desired battery power.
+
+        Positive = charge.
+        Negative = discharge.
+        """
+        grid_power = self._grid_power_w()
+
+        if grid_power is None:
+            return None
+
+        if abs(grid_power) <= self.DEAD_BAND_W:
+            return 0.0
+
+        return round(-grid_power, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        grid_power = self._grid_power_w()
+
+        return {
+            "bron_netvermogen": self.grid_power_entity,
+            "netvermogen_w": (
+                round(grid_power, 1)
+                if grid_power is not None
+                else None
+            ),
+            "dode_zone_w": self.DEAD_BAND_W,
+            "tekenrichting": (
+                "positief = laden, negatief = ontladen"
+            ),
+            "regelstrategie": "nul-op-de-meter, alleen berekening",
         }
 
 
