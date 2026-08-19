@@ -16,3 +16,8 @@ DEFAULT_CAPACITY_PER_DEVICE: Final = 2400.0
 DEFAULT_BALANCE_THRESHOLD: Final = 3.0
 
 CONF_GRID_POWER_ENTITY: Final = "grid_power_entity"
+
+CONF_GRID_DEAD_BAND_W: Final = "grid_dead_band_w"
+DEFAULT_GRID_DEAD_BAND_W: Final = 50.0
+
+CONF_KNOWN_SOLARFLOW_IDS: Final = "known_solarflow_ids"

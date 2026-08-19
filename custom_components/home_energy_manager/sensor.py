@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -15,11 +16,20 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfElectricPotential, UnitOfEnergy, UnitOfPower, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.util import dt as dt_util
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import CONF_CAPACITY_PER_DEVICE, CONF_GRID_POWER_ENTITY, DOMAIN
+from .const import (
+    CONF_CAPACITY_PER_DEVICE,
+    CONF_GRID_DEAD_BAND_W,
+    CONF_GRID_POWER_ENTITY,
+    CONF_KNOWN_SOLARFLOW_IDS,
+    DEFAULT_GRID_DEAD_BAND_W,
+    DOMAIN,
+)
 from .entity import HomeEnergyManagerEntity
 
 
@@ -28,12 +38,48 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up Home Energy Manager sensors from direct MQTT data."""
+    """Set up Home Energy Manager sensors with stable SolarFlow entities."""
     source_entities: set[str] = set()
+    manager = entry.runtime_data.mqtt_manager
+
+    def known_solarflow_device_ids() -> list[str]:
+        """Return known full SolarFlow IDs without requiring live MQTT."""
+        found: set[str] = {
+            str(device_id)
+            for device_id in entry.options.get(
+                CONF_KNOWN_SOLARFLOW_IDS,
+                [],
+            )
+        }
+        found.update(str(device_id) for device_id in manager.get_device_ids())
+
+        device_registry = dr.async_get(hass)
+        for device_entry in dr.async_entries_for_config_entry(
+            device_registry,
+            entry.entry_id,
+        ):
+            if device_entry.manufacturer != "Zendure":
+                continue
+
+            for identifier_domain, identifier in device_entry.identifiers:
+                if identifier_domain != DOMAIN:
+                    continue
+                identifier = str(identifier)
+                if identifier.startswith("EEB4") and len(identifier) >= 6:
+                    found.add(identifier)
+
+        return sorted(found)
+
+    device_ids = known_solarflow_device_ids()
 
     entities: list[SensorEntity] = [
         GridPowerSensor(entry, source_entities),
         DesiredBatteryPowerSensor(entry, source_entities),
+        RegulatedBatteryPowerSensor(entry, source_entities),
+        ControllerDiagnosticsSensor(entry, source_entities),
+        SolarFlowTargetPowerSensor(entry, source_entities, "040363"),
+        SolarFlowTargetPowerSensor(entry, source_entities, "040453"),
+        SolarFlowTargetPowerSensor(entry, source_entities, "040458"),
         VirtualSocSensor(entry, source_entities),
         VirtualCapacitySensor(entry, source_entities),
         CurrentEnergySensor(entry, source_entities),
@@ -106,68 +152,61 @@ async def async_setup_entry(
         RemainingOutputTimeSensor(entry, source_entities),
     ]
 
+    # Create all five PV entities for every known SolarFlow immediately.
+    # They no longer depend on whether a specific MQTT measurement happened
+    # to be present during setup.
+    for device_id in device_ids:
+        for measurement, name, icon in (
+            ("solarPower1", "PV ingang 1", "mdi:solar-panel"),
+            ("solarPower2", "PV ingang 2", "mdi:solar-panel"),
+            ("solarPower3", "PV ingang 3", "mdi:solar-panel"),
+            ("solarPower4", "PV ingang 4", "mdi:solar-panel"),
+            (
+                "solarInputPower",
+                "Totaal PV-ingangsvermogen",
+                "mdi:solar-power",
+            ),
+        ):
+            entities.append(
+                SolarFlowPvPowerSensor(
+                    entry,
+                    device_id,
+                    measurement,
+                    name,
+                    icon,
+                )
+            )
+
     async_add_entities(entities)
 
-    manager = entry.runtime_data.mqtt_manager
-    known_pv_entities: set[tuple[str, str]] = set()
-
-    @callback
-    def async_add_missing_pv_entities() -> None:
-        """Create per-SolarFlow PV sensors when MQTT data is discovered."""
-        new_entities: list[SensorEntity] = []
-
-        for device_id in sorted(manager.get_device_ids()):
-            device_values = manager.values.get(device_id, {})
-
-            for measurement, name, icon in (
-                ("solarPower1", "PV ingang 1", "mdi:solar-panel"),
-                ("solarPower2", "PV ingang 2", "mdi:solar-panel"),
-                ("solarPower3", "PV ingang 3", "mdi:solar-panel"),
-                ("solarPower4", "PV ingang 4", "mdi:solar-panel"),
-                (
-                    "solarInputPower",
-                    "Totaal PV-ingangsvermogen",
-                    "mdi:solar-power",
-                ),
-            ):
-                key = (device_id, measurement)
-
-                if key in known_pv_entities:
-                    continue
-
-                if measurement not in device_values:
-                    continue
-
-                known_pv_entities.add(key)
-                new_entities.append(
-                    SolarFlowPvPowerSensor(
-                        entry,
-                        device_id,
-                        measurement,
-                        name,
-                        icon,
-                    )
-                )
-
-        if new_entities:
-            async_add_entities(new_entities)
-
-    remove_listener = manager.async_add_listener(
-        async_add_missing_pv_entities
-    )
-    entry.async_on_unload(remove_listener)
-
-    async_add_missing_pv_entities()
+    # If MQTT is available, remember the full IDs for future starts where
+    # Zendure HEMS may have disabled MQTT.
+    live_ids = sorted(str(device_id) for device_id in manager.get_device_ids())
+    if live_ids:
+        current = list(
+            entry.options.get(
+                CONF_KNOWN_SOLARFLOW_IDS,
+                [],
+            )
+        )
+        if current != live_ids:
+            new_options = dict(entry.options)
+            new_options[CONF_KNOWN_SOLARFLOW_IDS] = live_ids
+            hass.config_entries.async_update_entry(
+                entry,
+                options=new_options,
+            )
 
 
-class SolarFlowPvPowerSensor(SensorEntity):
-    """Power sensor for one physical SolarFlow PV input."""
+class SolarFlowPvPowerSensor(RestoreSensor):
+    """Stable power sensor for one physical SolarFlow PV input."""
 
     _attr_has_entity_name = True
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_device_class = SensorDeviceClass.POWER
     _attr_state_class = SensorStateClass.MEASUREMENT
     _attr_suggested_display_precision = 0
+    _attr_available = True
 
     def __init__(
         self,
@@ -181,6 +220,7 @@ class SolarFlowPvPowerSensor(SensorEntity):
         self._entry = entry
         self._device_id = device_id
         self._measurement = measurement
+        self._last_value: float | None = None
 
         short_id = device_id[-6:]
         self._attr_unique_id = (
@@ -202,30 +242,55 @@ class SolarFlowPvPowerSensor(SensorEntity):
         """Return the shared Zendure MQTT manager."""
         return self._entry.runtime_data.mqtt_manager
 
-    @property
-    def native_value(self) -> float | None:
-        """Return current PV power from direct MQTT feedback."""
+    def _read_mqtt_value(self) -> float | None:
+        """Read a valid numeric value from the MQTT cache."""
         value = self.mqtt_manager.get_value(
             self._device_id,
             self._measurement,
         )
-
         try:
             return round(float(value), 1)
         except (TypeError, ValueError):
             return None
 
     @property
+    def native_value(self) -> float | None:
+        """Return live value, otherwise keep the last known value."""
+        value = self._read_mqtt_value()
+        if value is not None:
+            self._last_value = value
+        return self._last_value
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return MQTT source information."""
+        """Return source and availability information."""
+        live_value = self._read_mqtt_value()
         return {
             "mqtt_meting": self._measurement,
             "solarflow_id": self._device_id,
+            "mqtt_data_beschikbaar": live_value is not None,
+            "waarde_status": (
+                "live"
+                if live_value is not None
+                else "laatst bekende waarde"
+            ),
         }
 
     async def async_added_to_hass(self) -> None:
-        """Subscribe to MQTT cache updates."""
+        """Restore the previous value and subscribe to MQTT updates."""
         await super().async_added_to_hass()
+
+        live_value = self._read_mqtt_value()
+        if live_value is not None:
+            self._last_value = live_value
+        else:
+            last_data = await self.async_get_last_sensor_data()
+            if last_data is not None:
+                try:
+                    self._last_value = float(last_data.native_value)
+                except (TypeError, ValueError):
+                    self._last_value = None
+
         self.async_on_remove(
             self.mqtt_manager.async_add_listener(
                 self._async_mqtt_updated
@@ -234,7 +299,10 @@ class SolarFlowPvPowerSensor(SensorEntity):
 
     @callback
     def _async_mqtt_updated(self) -> None:
-        """Write MQTT feedback to Home Assistant."""
+        """Update only when a new valid MQTT value is available."""
+        value = self._read_mqtt_value()
+        if value is not None:
+            self._last_value = value
         self.async_write_ha_state()
 
 
@@ -700,8 +768,6 @@ class DesiredBatteryPowerSensor(BaseSensor):
     _attr_icon = "mdi:target"
     _attr_suggested_display_precision = 0
 
-    DEAD_BAND_W = 50.0
-
     def __init__(self, entry, source_entities) -> None:
         super().__init__(
             entry,
@@ -752,10 +818,38 @@ class DesiredBatteryPowerSensor(BaseSensor):
         if grid_power is None:
             return None
 
-        if abs(grid_power) <= self.DEAD_BAND_W:
+        dead_band = float(
+            self._entry.options.get(
+                CONF_GRID_DEAD_BAND_W,
+                DEFAULT_GRID_DEAD_BAND_W,
+            )
+        )
+
+        if abs(grid_power) <= dead_band:
             return 0.0
 
         return round(-grid_power, 1)
+
+    async def async_added_to_hass(self) -> None:
+        """Listen directly to every grid-power source update."""
+        await super().async_added_to_hass()
+
+        entity_id = self.grid_power_entity
+        if not entity_id:
+            return
+
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                [entity_id],
+                self._async_grid_power_changed,
+            )
+        )
+
+    @callback
+    def _async_grid_power_changed(self, event) -> None:
+        """Immediately recalculate desired battery power."""
+        self.async_write_ha_state()
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -768,11 +862,474 @@ class DesiredBatteryPowerSensor(BaseSensor):
                 if grid_power is not None
                 else None
             ),
-            "dode_zone_w": self.DEAD_BAND_W,
-            "tekenrichting": (
-                "positief = laden, negatief = ontladen"
-            ),
+            "dode_zone_w": float(self._entry.options.get(CONF_GRID_DEAD_BAND_W, DEFAULT_GRID_DEAD_BAND_W)),
+            "tekenrichting": "positief = laden, negatief = ontladen",
             "regelstrategie": "nul-op-de-meter, alleen berekening",
+            "update": "directe state-change listener",
+        }
+
+
+class _GridControllerMixin:
+    """Shared preview controller calculations."""
+
+    FILTER_ALPHA = 0.45
+    MAX_STEP_W = 500.0
+
+    @property
+    def grid_power_entity(self) -> str | None:
+        return self._entry.options.get(
+            CONF_GRID_POWER_ENTITY,
+            self._entry.data.get(CONF_GRID_POWER_ENTITY),
+        )
+
+    def _grid_power_w(self) -> float | None:
+        entity_id = self.grid_power_entity
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unknown", "unavailable"):
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        if state.attributes.get("unit_of_measurement") == "kW":
+            value *= 1000.0
+        return value
+
+    def _dead_band_w(self) -> float:
+        return float(
+            self._entry.options.get(
+                CONF_GRID_DEAD_BAND_W,
+                DEFAULT_GRID_DEAD_BAND_W,
+            )
+        )
+
+    def _raw_target_w(self) -> float | None:
+        grid_power = self._grid_power_w()
+        if grid_power is None:
+            return None
+        if abs(grid_power) <= self._dead_band_w():
+            return 0.0
+        return -grid_power
+
+    def _maximum_total_power_w(self) -> float:
+        manager = self._entry.runtime_data.mqtt_manager
+        device_ids = manager.get_device_ids()
+        if not device_ids:
+            return 0.0
+
+        limits: list[float] = []
+        for device_id in device_ids:
+            value = manager.get_number_value(device_id, "inverseMaxPower")
+            try:
+                limits.append(float(value))
+            except (TypeError, ValueError):
+                limits.append(2400.0)
+        return sum(max(0.0, value) for value in limits)
+
+    def _next_regulated(self, current: float | None) -> float | None:
+        raw = self._raw_target_w()
+        if raw is None:
+            return current
+
+        maximum = self._maximum_total_power_w()
+        raw = max(-maximum, min(maximum, raw))
+
+        if current is None:
+            value = raw
+        else:
+            filtered = self.FILTER_ALPHA * raw + (1.0 - self.FILTER_ALPHA) * current
+            delta = filtered - current
+            delta = max(-self.MAX_STEP_W, min(self.MAX_STEP_W, delta))
+            value = current + delta
+
+        if abs(value) <= self._dead_band_w():
+            value = 0.0
+
+        return value
+
+
+class RegulatedBatteryPowerSensor(_GridControllerMixin, BaseSensor):
+    """Preview of the stabilized total battery power target."""
+
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:tune-vertical"
+    _attr_suggested_display_precision = 0
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "regulated_battery_power",
+            "Geregeld batterijvermogen",
+        )
+        self._regulated_w: float | None = None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._regulated_w = self._next_regulated(self._regulated_w)
+        entity_id = self.grid_power_entity
+        if entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [entity_id],
+                    self._async_grid_power_changed,
+                )
+            )
+
+    @callback
+    def _async_grid_power_changed(self, event) -> None:
+        self._regulated_w = self._next_regulated(self._regulated_w)
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        return None if self._regulated_w is None else round(self._regulated_w, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "dode_zone_w": self._dead_band_w(),
+            "filter_alpha": self.FILTER_ALPHA,
+            "max_stap_per_update_w": self.MAX_STEP_W,
+            "max_totaalvermogen_w": round(self._maximum_total_power_w(), 1),
+            "tekenrichting": "positief = laden, negatief = ontladen",
+            "modus": "preview - geen MQTT besturing",
+        }
+
+
+class SolarFlowTargetPowerSensor(_GridControllerMixin, SensorEntity):
+    """Preview target power for one physical SolarFlow."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:battery-sync"
+    _attr_suggested_display_precision = 0
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        short_id: str,
+        identifiers: set[tuple[str, str]],
+    ) -> None:
+        self._entry = entry
+        self._short_id = short_id
+        self._regulated_total_w: float | None = None
+
+        self._attr_unique_id = (
+            f"{entry.entry_id}_solarflow_{short_id}_target_power"
+        )
+        self._attr_name = f"Doelvermogen {short_id}"
+
+        # Reuse the identifiers of the already existing physical SolarFlow
+        # device, so this entity attaches to that device even with MQTT off.
+        if identifiers:
+            self._attr_device_info = DeviceInfo(
+                identifiers=identifiers,
+                name=f"SolarFlow {short_id}",
+                manufacturer="Zendure",
+                model="SolarFlow 2400 Pro",
+                via_device=(DOMAIN, entry.entry_id),
+            )
+
+    @property
+    def _known_short_ids(self) -> set[str]:
+        """Return physical SolarFlow suffixes from existing control entities."""
+        entity_registry = er.async_get(self.hass)
+        result: set[str] = set()
+
+        for entity_entry in er.async_entries_for_config_entry(
+            entity_registry,
+            self._entry.entry_id,
+        ):
+            match = re.match(
+                r"^(?:number|select)\.solarflow_(\d{6})_",
+                entity_entry.entity_id,
+            )
+            if match is not None:
+                result.add(match.group(1))
+
+        return result
+
+    def _live_mqtt_id(self) -> str | None:
+        """Return matching live Zendure MQTT device ID, if available."""
+        for device_id in (
+            self._entry.runtime_data.mqtt_manager.get_device_ids()
+        ):
+            if str(device_id).endswith(self._short_id):
+                return str(device_id)
+        return None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._regulated_total_w = self._next_regulated(
+            self._regulated_total_w
+        )
+
+        entity_id = self.grid_power_entity
+        if entity_id:
+            self.async_on_remove(
+                async_track_state_change_event(
+                    self.hass,
+                    [entity_id],
+                    self._async_grid_power_changed,
+                )
+            )
+
+    @callback
+    def _async_grid_power_changed(self, event) -> None:
+        self._regulated_total_w = self._next_regulated(
+            self._regulated_total_w
+        )
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> float | None:
+        if self._regulated_total_w is None:
+            return None
+
+        device_count = len(self._known_short_ids)
+        if device_count <= 0:
+            return None
+
+        return round(
+            self._regulated_total_w / device_count,
+            1,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        live_mqtt_id = self._live_mqtt_id()
+
+        return {
+            "solarflow": self._short_id,
+            "verdeling": "gelijk over alle SolarFlows",
+            "aantal_solarflows": len(self._known_short_ids),
+            "mqtt_besturing_beschikbaar": live_mqtt_id is not None,
+            "mqtt_status": (
+                "online" if live_mqtt_id is not None
+                else "niet beschikbaar"
+            ),
+            "mqtt_device_id": live_mqtt_id,
+            "bron_apparaatlijst": "Home Assistant entity registry",
+            "tekenrichting": "positief = laden, negatief = ontladen",
+            "modus": "preview - geen MQTT besturing",
+        }
+
+
+class SolarFlowTargetPowerSensor(BaseSensor):
+    """Preview target power for one SolarFlow.
+
+    Positive = charging, negative = discharging.
+    This sensor does not control the SolarFlow yet.
+    """
+
+    _attr_native_unit_of_measurement = UnitOfPower.WATT
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:target"
+
+    def __init__(self, entry, source_entities, short_id: str) -> None:
+        self._short_id = short_id
+        super().__init__(
+            entry,
+            source_entities,
+            f"target_power_{short_id}",
+            f"Doelvermogen {short_id}",
+        )
+
+    def _solarflow_ids(self) -> list[str]:
+        """Discover SolarFlows from their HA control entities."""
+        entity_registry = er.async_get(self.hass)
+        found: set[str] = set()
+
+        for entity_entry in er.async_entries_for_config_entry(
+            entity_registry,
+            self._entry.entry_id,
+        ):
+            match = re.match(
+                r"^(?:number|select)\.solarflow_(\d{6})_",
+                entity_entry.entity_id,
+            )
+            if match is not None:
+                found.add(match.group(1))
+
+        return sorted(found)
+
+    @property
+    def native_value(self) -> float | None:
+        grid_entity = self._entry.options.get(
+            CONF_GRID_POWER_ENTITY,
+            self._entry.data.get(CONF_GRID_POWER_ENTITY),
+        )
+        if not grid_entity:
+            return None
+
+        grid_state = self.hass.states.get(grid_entity)
+        if grid_state is None:
+            return None
+
+        try:
+            grid_power_w = float(grid_state.state)
+            if grid_state.attributes.get("unit_of_measurement") == "kW":
+                grid_power_w *= 1000.0
+        except (TypeError, ValueError):
+            return None
+
+        dead_band = float(
+            self._entry.options.get(
+                CONF_GRID_DEAD_BAND_W,
+                DEFAULT_GRID_DEAD_BAND_W,
+            )
+        )
+
+        if abs(grid_power_w) <= dead_band:
+            desired_power_w = 0.0
+        else:
+            desired_power_w = -grid_power_w
+
+        ids = self._solarflow_ids()
+        if self._short_id not in ids or not ids:
+            return None
+
+        return round(desired_power_w / len(ids), 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "solarflow_id": self._short_id,
+            "betekenis": "positief = laden, negatief = ontladen",
+            "besturing_actief": False,
+            "stap": "5h preview",
+        }
+
+
+class ControllerDiagnosticsSensor(BaseSensor):
+    """Diagnostics for controller target discovery and preview calculation."""
+
+    _attr_icon = "mdi:bug-check"
+
+    def __init__(self, entry, source_entities) -> None:
+        super().__init__(
+            entry,
+            source_entities,
+            "controller_diagnostics",
+            "Regelaar diagnostiek",
+        )
+
+    def _matching_target_entities(self) -> dict[str, list[str]]:
+        """Return existing SolarFlow control entities grouped by short ID."""
+        entity_registry = er.async_get(self.hass)
+        result: dict[str, list[str]] = {}
+
+        for entity_entry in er.async_entries_for_config_entry(
+            entity_registry,
+            self._entry.entry_id,
+        ):
+            match = re.match(
+                r"^(?:number|select)\.solarflow_(\d{6})_",
+                entity_entry.entity_id,
+            )
+            if match is None:
+                continue
+
+            short_id = match.group(1)
+            result.setdefault(short_id, []).append(
+                entity_entry.entity_id
+            )
+
+        return {
+            short_id: sorted(entities)
+            for short_id, entities in sorted(result.items())
+        }
+
+    @property
+    def native_value(self) -> int:
+        """Return number of discovered physical SolarFlows."""
+        return len(self._matching_target_entities())
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return detailed controller discovery information."""
+        targets = self._matching_target_entities()
+
+        live_mqtt_ids = sorted(
+            str(device_id)
+            for device_id in (
+                self._entry.runtime_data.mqtt_manager.get_device_ids()
+            )
+        )
+
+        grid_entity = self._entry.options.get(
+            CONF_GRID_POWER_ENTITY,
+            self._entry.data.get(CONF_GRID_POWER_ENTITY),
+        )
+
+        grid_state = (
+            self.hass.states.get(grid_entity)
+            if grid_entity
+            else None
+        )
+
+        grid_power_w = None
+        if grid_state is not None:
+            try:
+                grid_power_w = float(grid_state.state)
+                if (
+                    grid_state.attributes.get("unit_of_measurement")
+                    == "kW"
+                ):
+                    grid_power_w *= 1000.0
+            except (TypeError, ValueError):
+                grid_power_w = None
+
+        dead_band = float(
+            self._entry.options.get(
+                CONF_GRID_DEAD_BAND_W,
+                DEFAULT_GRID_DEAD_BAND_W,
+            )
+        )
+
+        if grid_power_w is None:
+            desired_power_w = None
+        elif abs(grid_power_w) <= dead_band:
+            desired_power_w = 0.0
+        else:
+            desired_power_w = -grid_power_w
+
+        return {
+            "gevonden_solarflows": sorted(targets.keys()),
+            "aantal_gevonden_solarflows": len(targets),
+            "control_entities_per_solarflow": targets,
+            "live_mqtt_device_ids": live_mqtt_ids,
+            "mqtt_beschikbaar": bool(live_mqtt_ids),
+            "netvermogen_entity": grid_entity,
+            "netvermogen_w": (
+                round(grid_power_w, 1)
+                if grid_power_w is not None
+                else None
+            ),
+            "dode_zone_w": dead_band,
+            "gewenst_batterijvermogen_w": (
+                round(desired_power_w, 1)
+                if desired_power_w is not None
+                else None
+            ),
+            "verwachte_verdeling_w": (
+                round(
+                    desired_power_w / len(targets),
+                    1,
+                )
+                if desired_power_w is not None and targets
+                else None
+            ),
+            "modus": "diagnostiek - geen MQTT besturing",
         }
 
 

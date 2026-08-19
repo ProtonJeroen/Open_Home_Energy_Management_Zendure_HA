@@ -13,6 +13,7 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_BALANCE_THRESHOLD,
     CONF_GRID_POWER_ENTITY,
+    CONF_GRID_DEAD_BAND_W,
     CONF_CAPACITY_PER_DEVICE,
     CONF_PACK_INPUT_ENTITIES,
     CONF_PACK_OUTPUT_ENTITIES,
@@ -20,6 +21,7 @@ from .const import (
     CONF_SOC_ENTITIES,
     DEFAULT_BALANCE_THRESHOLD,
     DEFAULT_CAPACITY_PER_DEVICE,
+    DEFAULT_GRID_DEAD_BAND_W,
     DOMAIN,
 )
 
@@ -49,7 +51,7 @@ class HomeEnergyManagerConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "no_soc_entities"
             else:
                 return self.async_create_entry(
-                    title="Virtuele batterij",
+                    title="Battery System",
                     data=user_input,
                 )
 
@@ -173,6 +175,26 @@ class HomeEnergyManagerOptionsFlow(config_entries.OptionsFlow):
                     multiple=False,
                 )
             )
+
+        current_dead_band = self.config_entry.options.get(
+            CONF_GRID_DEAD_BAND_W,
+            DEFAULT_GRID_DEAD_BAND_W,
+        )
+
+        schema_dict[
+            vol.Optional(
+                CONF_GRID_DEAD_BAND_W,
+                default=current_dead_band,
+            )
+        ] = selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0,
+                max=500,
+                step=10,
+                unit_of_measurement="W",
+                mode=selector.NumberSelectorMode.BOX,
+            )
+        )
 
         return self.async_show_form(
             step_id="init",
