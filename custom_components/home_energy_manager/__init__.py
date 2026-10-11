@@ -10,9 +10,19 @@ from typing import TypeAlias
 from homeassistant.components import mqtt
 from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import PLATFORMS
+from .const import (
+    CONF_AUTOMATIC_BATTERY_CONTROL,
+    CONF_GRID_POWER_ENTITY,
+    CONF_MAX_POWER_PER_BATTERY_W,
+    DEFAULT_AUTOMATIC_BATTERY_CONTROL,
+    DEFAULT_MAX_POWER_PER_BATTERY_W,
+    DOMAIN,
+    PLATFORMS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -262,6 +272,41 @@ class ZendureMqttManager:
         """Return a cached Zendure select setting."""
         return self.select_values.get(device_id, {}).get(setting)
 
+    async def async_set_number_value(
+        self,
+        device_id: str,
+        setting: str,
+        value: float,
+    ) -> None:
+        """Publish a Zendure number command."""
+        if setting not in ZENDURE_NUMBER_SETTINGS:
+            raise ValueError(
+                f"Unsupported Zendure number setting: {setting}"
+            )
+
+        topic = (
+            f"{ZENDURE_NUMBER_TOPIC}/"
+            f"{device_id}/{setting}/set"
+        )
+
+        payload = str(int(value)) if float(value).is_integer() else str(value)
+
+        await mqtt.async_publish(
+            self.hass,
+            topic,
+            payload,
+            qos=0,
+            retain=False,
+        )
+
+        _LOGGER.info(
+            "Zendure MQTT number opdracht verzonden: "
+            "apparaat=%s, setting=%s, waarde=%s",
+            device_id,
+            setting,
+            payload,
+        )
+
     async def async_set_select_value(
         self,
         device_id: str,
@@ -409,9 +454,148 @@ class HomeEnergyManagerRuntimeData:
 
     source_entities: set[str]
     mqtt_manager: ZendureMqttManager
+    battery_controller: object | None = None
 
 
 HomeEnergyManagerConfigEntry = ConfigEntry[HomeEnergyManagerRuntimeData]
+
+
+class BatteryControlManager:
+    """Translate preview target power to Zendure input/output limits."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: HomeEnergyManagerConfigEntry,
+        mqtt_manager: ZendureMqttManager,
+    ) -> None:
+        self.hass = hass
+        self.entry = entry
+        self.mqtt_manager = mqtt_manager
+        self._unsub: Callable[[], None] | None = None
+        self._unsub_registry: Callable[[], None] | None = None
+        self._target_entities: dict[str, str] = {}
+        self._last_commands: dict[str, tuple[int, int]] = {}
+
+    async def async_start(self) -> None:
+        """Listen to target sensor state changes."""
+        self._unsub_registry = self.hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED,
+            self._async_registry_updated,
+        )
+        self._async_refresh_target_entities()
+
+    @callback
+    def _async_registry_updated(self, event) -> None:
+        """Follow target entities created or renamed after setup."""
+        self._async_refresh_target_entities()
+
+    @callback
+    def _async_refresh_target_entities(self) -> None:
+        """Resolve target sensor IDs using their stable unique IDs."""
+        registry = er.async_get(self.hass)
+        targets: dict[str, str] = {}
+        for short_id in ("040363", "040453", "040458"):
+            entity_id = registry.async_get_entity_id(
+                "sensor", DOMAIN, f"{self.entry.entry_id}_target_power_{short_id}"
+            )
+            if entity_id is not None:
+                targets[entity_id] = short_id
+
+        if targets == self._target_entities:
+            return
+        if self._unsub:
+            self._unsub()
+            self._unsub = None
+        self._target_entities = targets
+        if targets:
+            self._unsub = async_track_state_change_event(
+                self.hass, list(targets), self._async_target_changed
+            )
+        _LOGGER.debug("SolarFlow doelvermogen-koppelingen: %s", targets)
+
+    async def async_stop(self) -> None:
+        if self._unsub_registry:
+            self._unsub_registry()
+            self._unsub_registry = None
+        if self._unsub:
+            self._unsub()
+            self._unsub = None
+        self._target_entities.clear()
+
+    async def _async_target_changed(self, event) -> None:
+        """Apply one changed target when automatic control is enabled."""
+        if not self.entry.options.get(
+            CONF_AUTOMATIC_BATTERY_CONTROL,
+            DEFAULT_AUTOMATIC_BATTERY_CONTROL,
+        ):
+            return
+
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+
+        try:
+            target = float(new_state.state)
+        except (TypeError, ValueError):
+            return
+
+        short_id = self._target_entities.get(new_state.entity_id)
+        if short_id is None:
+            return
+        full_id = next(
+            (
+                str(device_id)
+                for device_id in self.mqtt_manager.get_device_ids()
+                if str(device_id).endswith(short_id)
+            ),
+            None,
+        )
+        if full_id is None:
+            _LOGGER.debug(
+                "Geen live MQTT device voor SolarFlow %s; opdracht overgeslagen",
+                short_id,
+            )
+            return
+
+        # Positive target = charge, negative target = discharge.
+        max_power = float(
+            self.entry.options.get(
+                CONF_MAX_POWER_PER_BATTERY_W,
+                DEFAULT_MAX_POWER_PER_BATTERY_W,
+            )
+        )
+
+        target = max(-max_power, min(max_power, target))
+
+        input_limit = max(0, int(round(target)))
+        output_limit = max(0, int(round(-target)))
+
+        # Never leave charge and discharge limits active together.
+        command = (input_limit, output_limit)
+        if self._last_commands.get(full_id) == command:
+            return
+
+        await self.mqtt_manager.async_set_number_value(
+            full_id,
+            "inputLimit",
+            input_limit,
+        )
+        await self.mqtt_manager.async_set_number_value(
+            full_id,
+            "outputLimit",
+            output_limit,
+        )
+        self._last_commands[full_id] = command
+
+
+
+async def async_update_options(
+    hass: HomeAssistant,
+    entry: HomeEnergyManagerConfigEntry,
+) -> None:
+    """Reload Home Energy Manager after options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_setup_entry(
@@ -422,19 +606,41 @@ async def async_setup_entry(
     soc_entities = set(entry.data["soc_entities"])
     power_entities = set(entry.data.get("power_entities", []))
 
+    grid_power_entity = entry.options.get(
+        CONF_GRID_POWER_ENTITY,
+        entry.data.get(CONF_GRID_POWER_ENTITY),
+    )
+
+    source_entities = soc_entities | power_entities
+    if grid_power_entity:
+        source_entities.add(grid_power_entity)
+
     mqtt_manager = ZendureMqttManager(hass)
 
     entry.runtime_data = HomeEnergyManagerRuntimeData(
-        source_entities=soc_entities | power_entities,
+        source_entities=source_entities,
         mqtt_manager=mqtt_manager,
     )
 
+    entry.async_on_unload(
+        entry.add_update_listener(async_update_options)
+    )
+
     await mqtt_manager.async_start()
+
+    battery_controller = BatteryControlManager(
+        hass,
+        entry,
+        mqtt_manager,
+    )
+    entry.runtime_data.battery_controller = battery_controller
 
     await hass.config_entries.async_forward_entry_setups(
         entry,
         PLATFORMS,
     )
+
+    await battery_controller.async_start()
 
     return True
 
@@ -450,6 +656,10 @@ async def async_unload_entry(
     )
 
     if unload_ok:
+        controller = entry.runtime_data.battery_controller
+        if controller is not None:
+            await controller.async_stop()
         await entry.runtime_data.mqtt_manager.async_stop()
 
     return unload_ok
+

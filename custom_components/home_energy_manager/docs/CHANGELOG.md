@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.5.1 — HACS-installatie en 5aa
+
+- HACS-configuratie en installatie-/update-instructies toegevoegd.
+- Manifest aangevuld met beheerder, documentatie en issue-tracker.
+- Bevat de bestaande 0.5-regeling en 5aa: Doelvermogen-listeners gebruiken de
+  entity registry en blijven werken na hernoemen van sensoren.
+- Geen nieuwe wijzigingen aan de regelalgoritmes.
+
+
+
+## Zendure Firmware update results in MQTT down when Hems is active (18-08-2026)
+
 ## v0.4.0
 
 - Directe MQTT-besturing van fysieke Zendure SolarFlow-units
@@ -52,3 +64,4 @@
 ## 0.1.0
 
 - Eerste uitleesversie.
+
