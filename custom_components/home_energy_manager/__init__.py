@@ -10,7 +10,9 @@ from typing import TypeAlias
 from homeassistant.components import mqtt
 from homeassistant.components.mqtt import ReceiveMessage
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import (
     CONF_AUTOMATIC_BATTERY_CONTROL,
@@ -18,6 +20,7 @@ from .const import (
     CONF_MAX_POWER_PER_BATTERY_W,
     DEFAULT_AUTOMATIC_BATTERY_CONTROL,
     DEFAULT_MAX_POWER_PER_BATTERY_W,
+    DOMAIN,
     PLATFORMS,
 )
 
@@ -470,27 +473,55 @@ class BatteryControlManager:
         self.entry = entry
         self.mqtt_manager = mqtt_manager
         self._unsub: Callable[[], None] | None = None
+        self._unsub_registry: Callable[[], None] | None = None
+        self._target_entities: dict[str, str] = {}
         self._last_commands: dict[str, tuple[int, int]] = {}
 
     async def async_start(self) -> None:
         """Listen to target sensor state changes."""
-        from homeassistant.helpers.event import async_track_state_change_event
-
-        entity_ids = [
-            "sensor.doelvermogen_040363",
-            "sensor.doelvermogen_040453",
-            "sensor.doelvermogen_040458",
-        ]
-        self._unsub = async_track_state_change_event(
-            self.hass,
-            entity_ids,
-            self._async_target_changed,
+        self._unsub_registry = self.hass.bus.async_listen(
+            er.EVENT_ENTITY_REGISTRY_UPDATED,
+            self._async_registry_updated,
         )
+        self._async_refresh_target_entities()
 
-    async def async_stop(self) -> None:
+    @callback
+    def _async_registry_updated(self, event) -> None:
+        """Follow target entities created or renamed after setup."""
+        self._async_refresh_target_entities()
+
+    @callback
+    def _async_refresh_target_entities(self) -> None:
+        """Resolve target sensor IDs using their stable unique IDs."""
+        registry = er.async_get(self.hass)
+        targets: dict[str, str] = {}
+        for short_id in ("040363", "040453", "040458"):
+            entity_id = registry.async_get_entity_id(
+                "sensor", DOMAIN, f"{self.entry.entry_id}_target_power_{short_id}"
+            )
+            if entity_id is not None:
+                targets[entity_id] = short_id
+
+        if targets == self._target_entities:
+            return
         if self._unsub:
             self._unsub()
             self._unsub = None
+        self._target_entities = targets
+        if targets:
+            self._unsub = async_track_state_change_event(
+                self.hass, list(targets), self._async_target_changed
+            )
+        _LOGGER.debug("SolarFlow doelvermogen-koppelingen: %s", targets)
+
+    async def async_stop(self) -> None:
+        if self._unsub_registry:
+            self._unsub_registry()
+            self._unsub_registry = None
+        if self._unsub:
+            self._unsub()
+            self._unsub = None
+        self._target_entities.clear()
 
     async def _async_target_changed(self, event) -> None:
         """Apply one changed target when automatic control is enabled."""
@@ -509,7 +540,9 @@ class BatteryControlManager:
         except (TypeError, ValueError):
             return
 
-        short_id = new_state.entity_id.rsplit("_", 1)[-1]
+        short_id = self._target_entities.get(new_state.entity_id)
+        if short_id is None:
+            return
         full_id = next(
             (
                 str(device_id)
@@ -629,3 +662,4 @@ async def async_unload_entry(
         await entry.runtime_data.mqtt_manager.async_stop()
 
     return unload_ok
+
